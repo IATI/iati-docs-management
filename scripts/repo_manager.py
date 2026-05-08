@@ -233,9 +233,7 @@ class RepoManager:
 
         return result
 
-    def check_all_repos(
-        self, files: list[str] | None = None
-    ) -> dict[str, list[dict]]:
+    def check_all_repos(self, files: list[str] | None = None) -> dict[str, list[dict]]:
         """
         Check all repos against the template.
 
@@ -888,12 +886,14 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Manage IATI documentation repositories.\n\n"
-        "Publishing behaviour:\n"
-        "  * 'sync' runs in DRY-RUN mode by default and only publishes\n"
-        "    (commits, pushes, opens PRs) when --apply is passed.\n"
+        "Verbs:\n"
+        "  * 'list' and 'check' are read-only.\n"
+        "  * 'sync' commits, pushes, and opens a pull request against each\n"
+        "    repo's default branch. Use 'check' first to preview the diffs.\n"
         "  * 'run-script' publishes automatically if the script produces\n"
-        "    filesystem changes; if it doesn't, the run is informational.\n"
-        "    Non-zero exits abort the run with no changes published.",
+        "    filesystem changes; otherwise the run is informational. A\n"
+        "    non-zero exit in any repo aborts the run with no changes\n"
+        "    published.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -902,9 +902,7 @@ def main():
     subparsers.add_parser("list", help="List all tagged documentation repos")
 
     # Check command
-    check_parser = subparsers.add_parser(
-        "check", help="Check repos against template"
-    )
+    check_parser = subparsers.add_parser("check", help="Check repos against template")
     check_parser.add_argument(
         "--files",
         nargs="+",
@@ -920,12 +918,13 @@ def main():
     # Sync command
     sync_parser = subparsers.add_parser(
         "sync",
-        help="Sync template files to repos and open PRs (dry-run by default)",
+        help="Sync template files to repos and open PRs",
         description="For each Documentation-tagged repo: copy the specified files from\n"
-        "iati-docs-base, commit them on a fresh working branch, push the branch,\n"
-        "and open a pull request against the repo's default branch.\n\n"
-        "By default, runs in DRY-RUN mode and does not push or open any PRs.\n"
-        "Use --apply to actually publish the changes.",
+        "iati-docs-base, commit them on a fresh working branch, push the\n"
+        "branch, and open a pull request against the repo's default branch.\n"
+        "Repos where every tracked file already matches the template are\n"
+        "skipped without producing a PR.\n\n"
+        "Use 'check' first if you want to preview the per-file diffs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sync_parser.add_argument(
@@ -948,11 +947,6 @@ def main():
     sync_parser.add_argument(
         "--pr-body",
         help="Body for the pull requests (default: auto-generated)",
-    )
-    sync_parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Actually push and open PRs (without this flag, only shows what would change)",
     )
 
     # Run-script command
@@ -1037,27 +1031,23 @@ def main():
             # Summary
             total_files = sum(len(r) for r in results.values())
             matching = sum(
-                1 for repo_results in results.values()
-                for r in repo_results if r.get("matches")
+                1
+                for repo_results in results.values()
+                for r in repo_results
+                if r.get("matches")
             )
             print(f"\nSummary: {matching}/{total_files} files match template")
 
         elif args.command == "sync":
-            dry_run = not args.apply
-            mode = "DRY RUN" if dry_run else "APPLIED"
-
-            # Always actually copy files into the (ephemeral) tempdir so that
-            # commit_changes can give an accurate report in dry-run mode.
-            # --apply only gates what touches GitHub: commit, push, and PR.
             copy_results = manager.sync_all_repos(args.files, dry_run=False)
             print_results(copy_results, "FILE COPY")
 
             push_results = manager.update_all_to_github(
                 args.message,
                 pr_body=args.pr_body,
-                dry_run=dry_run,
+                dry_run=False,
             )
-            print_results(push_results, f"COMMIT + PUSH + PR ({mode})")
+            print_results(push_results, "COMMIT + PUSH + PR")
 
         elif args.command == "run-script":
             results = manager.run_script_on_all_repos(
@@ -1066,9 +1056,7 @@ def main():
             )
             print_run_script_results(results, "RUN-SCRIPT RESULTS")
 
-            failed = next(
-                (r for r in results.values() if r.get("failed")), None
-            )
+            failed = next((r for r in results.values() if r.get("failed")), None)
             if failed:
                 print(
                     f"\nERROR: Script failed in {failed['repo']} "
@@ -1077,9 +1065,7 @@ def main():
                 )
                 return 1
 
-            repos_with_changes = [
-                r for r in results.values() if r.get("changed_files")
-            ]
+            repos_with_changes = [r for r in results.values() if r.get("changed_files")]
             if not repos_with_changes:
                 print("\nNo file changes; nothing to commit or push.")
                 return

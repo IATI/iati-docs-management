@@ -36,11 +36,8 @@ A Python 3.13 CLI with four commands for working across every Documentation-tagg
   # Show which repos diverge from the template, with diffs
   python scripts/repo_manager.py check
 
-  # Dry run: show what would be synced, committed, and PR'd
+  # Sync template files and open PRs against each repo's default branch
   python scripts/repo_manager.py sync -m "Sync from template"
-
-  # Actually push branches and open PRs against each repo's default branch
-  python scripts/repo_manager.py sync -m "Sync from template" --apply
 
   # Run an inspection script in each repo (no changes -> no PRs)
   python scripts/repo_manager.py run-script ./find-myst-parser.sh
@@ -52,7 +49,9 @@ A Python 3.13 CLI with four commands for working across every Documentation-tagg
 sync
 ~~~~
 
-Performs the full template-sync flow per repo: copy template files, commit on a fresh working branch (default ``iati-docs-management/sync-<timestamp>``), push, and open a pull request against the repo's default branch. It never commits to ``main`` - a defence-in-depth check refuses to operate if the working tree somehow ends up on the default branch. Override the branch name with ``--branch-name`` and the PR body with ``--pr-body``.
+Performs the full template-sync flow per repo: copy template files, commit on a fresh working branch (default ``iati-docs-management/sync-<timestamp>``), push, and open a pull request against the repo's default branch. Repos where every tracked file already matches the template are skipped without producing a PR. The PR review process itself is the human gate - run ``check`` first if you'd like to preview the per-file diffs.
+
+It never commits to ``main`` - a defence-in-depth check refuses to operate if the working tree somehow ends up on the default branch. Override the branch name with ``--branch-name`` and the PR body with ``--pr-body``.
 
 By default, ``check`` and ``sync`` operate on:
 
