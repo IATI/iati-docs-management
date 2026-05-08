@@ -503,11 +503,10 @@ class RepoManager:
 
     def _ensure_safe_branch(self, repo: RepoCheckout) -> None:
         """
-        Refuse to operate if the working tree is on a branch that would
-        cause changes to land on the repo's default (or main/master).
-
-        This is defence in depth: checkouts already switch to the working
-        branch, so this guard only fires if that switch silently failed.
+        Refuse to operate unless the working tree is on the expected
+        working branch. Catches both the case where the checkout failed
+        to switch off the default branch and the case where someone
+        manually switched branches between checkout and publish.
         """
         current = self._current_branch(repo.path)
         default = self._default_branch(repo.path)
@@ -516,6 +515,12 @@ class RepoManager:
                 f"Refusing to operate on branch {current!r} in {repo.name} "
                 f"(default branch is {default!r}). Expected to be on "
                 f"{self.branch_name!r} - did the checkout fail?"
+            )
+        if current != self.branch_name:
+            raise RuntimeError(
+                f"Refusing to operate on branch {current!r} in {repo.name}: "
+                f"expected {self.branch_name!r}. Pass --branch-name to "
+                "match the actual branch, or switch the checkout."
             )
 
     def commit_changes(
@@ -684,13 +689,11 @@ class RepoManager:
         results = {}
         for repo in self.repos:
             commit_result = self.commit_changes(repo, commit_message, dry_run)
-
-            if commit_result["action"] == "commit":
-                push_result = self.push_changes(
-                    repo, pr_title, pr_body, dry_run=dry_run
-                )
-            else:
-                push_result = {"action": "skip", "reason": "No commit made"}
+            # Always attempt push; push_changes self-skips when there are no
+            # commits ahead. This way pre-existing commits on the working
+            # branch (e.g. from a manual commit before make-prs) still get
+            # published.
+            push_result = self.push_changes(repo, pr_title, pr_body, dry_run=dry_run)
 
             results[repo.name] = {
                 "commit": commit_result,
@@ -893,7 +896,11 @@ def main():
         "  * 'run-script' publishes automatically if the script produces\n"
         "    filesystem changes; otherwise the run is informational. A\n"
         "    non-zero exit in any repo aborts the run with no changes\n"
-        "    published.",
+        "    published.\n"
+        "  * 'checkout-all' + 'make-prs' is the manual-edit flow: clone\n"
+        "    every repo to a persistent dir, edit files by hand, then\n"
+        "    publish the lot as PRs in one go. Use this for cross-repo\n"
+        "    refactors that don't fit a template-sync or single script.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -996,6 +1003,65 @@ def main():
         help="Body for the pull requests (default: auto-generated)",
     )
 
+    # Checkout-all command
+    checkout_parser = subparsers.add_parser(
+        "checkout-all",
+        help="Clone every tagged repo to a persistent dir for manual edits",
+        description="Clone every Documentation-tagged repo (and the template) to a\n"
+        "fresh directory under /tmp, create a working branch in each, and\n"
+        "exit. The directory is NOT cleaned up - that's the whole point.\n\n"
+        "Use this when the work doesn't fit a template-sync or a single\n"
+        "scripted change: edit files by hand across the checkouts, then\n"
+        "run 'make-prs' to commit and PR everything in one go.\n\n"
+        "macOS prunes /tmp via the periodic daily job (files older than 3\n"
+        "days), so anything left behind is reclaimed by the OS.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    checkout_parser.add_argument(
+        "--branch-name",
+        help="Override the auto-generated working branch name "
+        "(default: iati-docs-management/refactor-<timestamp>)",
+    )
+    checkout_parser.add_argument(
+        "--no-template",
+        action="store_true",
+        help="Skip cloning the template repo (iati-docs-base)",
+    )
+
+    # Make-prs command
+    make_prs_parser = subparsers.add_parser(
+        "make-prs",
+        help="Commit and PR changes from a checkout-all directory",
+        description="For each repo checkout in --dir: stage uncommitted changes,\n"
+        "commit with -m MSG, push the working branch, and open a pull\n"
+        "request against the repo's default branch. Repos with nothing to\n"
+        "publish (clean tree and no commits ahead) are skipped.\n\n"
+        "Pair with 'checkout-all'.\n\n"
+        "The working branch is detected from the first checkout unless\n"
+        "--branch-name is given. All checkouts must be on the same branch;\n"
+        "any repo on a different branch will abort with an error.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    make_prs_parser.add_argument(
+        "--dir",
+        required=True,
+        help="Directory containing the repo checkouts (from checkout-all)",
+    )
+    make_prs_parser.add_argument(
+        "--message",
+        "-m",
+        required=True,
+        help="Commit message (also used as PR title unless --pr-body overrides)",
+    )
+    make_prs_parser.add_argument(
+        "--branch-name",
+        help="Working branch name (default: detected from first checkout)",
+    )
+    make_prs_parser.add_argument(
+        "--pr-body",
+        help="Body for the pull requests (default: auto-generated)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "list":
@@ -1008,6 +1074,76 @@ def main():
 
     if args.command is None:
         parser.print_help()
+        return
+
+    if args.command == "checkout-all":
+        branch_name = args.branch_name or RepoManager.generate_branch_name(
+            prefix="refactor"
+        )
+        # Persistent: do NOT use the context manager - we want the
+        # checkouts to outlive this invocation so the user can edit them
+        # by hand and pass --dir to make-prs later.
+        manager = RepoManager(branch_name=branch_name)
+        print(f"Working directory: {manager.work_dir}")
+        print(f"Working branch: {manager.branch_name}")
+        print("Checking out repositories...")
+        manager.checkout_all(include_template=not args.no_template)
+        print(f"\nCheckouts ready in: {manager.work_dir}")
+        print(f"Branch in each repo:  {manager.branch_name}")
+        print("\nNext: edit files in the checkouts, then run:")
+        print(
+            f"  python scripts/repo_manager.py make-prs "
+            f"--dir {manager.work_dir} -m 'Your commit message'"
+        )
+        return
+
+    if args.command == "make-prs":
+        work_dir = Path(args.dir)
+        if not work_dir.is_dir():
+            parser.error(f"--dir {work_dir} is not a directory")
+
+        checkouts = sorted(
+            p
+            for p in work_dir.iterdir()
+            if p.is_dir() and (p / ".git").exists() and p.name != TEMPLATE_REPO
+        )
+        if not checkouts:
+            print(f"No repository checkouts found in {work_dir}")
+            return
+
+        branch_name = args.branch_name
+        if branch_name is None:
+            detected = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=checkouts[0],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            if not detected:
+                parser.error(
+                    f"Could not detect branch from {checkouts[0]} "
+                    "(detached HEAD?). Pass --branch-name."
+                )
+            branch_name = detected
+
+        # Reuse the existing RepoManager: point it at the already-populated
+        # work_dir, register each subdir as a tracked checkout, and call the
+        # standard publish flow. We never invoke cleanup() so the checkouts
+        # persist for re-runs if needed.
+        manager = RepoManager(work_dir=work_dir, branch_name=branch_name)
+        for path in checkouts:
+            manager.repos.append(RepoCheckout(name=path.name, path=path))
+
+        print(f"Working directory: {manager.work_dir}")
+        print(f"Working branch: {manager.branch_name}")
+        print(f"Repos to process: {len(manager.repos)}")
+        push_results = manager.update_all_to_github(
+            args.message,
+            pr_body=args.pr_body,
+            dry_run=False,
+        )
+        print_results(push_results, "COMMIT + PUSH + PR")
         return
 
     # Pick a branch name. run-script uses a script-specific prefix so its

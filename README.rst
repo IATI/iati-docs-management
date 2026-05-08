@@ -26,7 +26,7 @@ IATI documentation repos are identified by a GitHub `custom repository property 
 scripts/repo_manager.py
 -----------------------
 
-A Python 3.13 CLI with four commands for working across every Documentation-tagged repo, using ``iati-docs-base`` as the template. Anything outside this scope - one-off fixes, ad-hoc edits to a single repo - should be done by hand on a single branch, not via this tool.
+A Python 3.13 CLI for working across every Documentation-tagged repo, using ``iati-docs-base`` as the template. The commands cover three flavours of cross-repo work: template syncs, scripted changes, and manual refactors. Anything that's genuinely a one-off in a single repo should be done by hand on a single branch, not via this tool.
 
 .. code-block:: bash
 
@@ -45,6 +45,13 @@ A Python 3.13 CLI with four commands for working across every Documentation-tagg
   # Run a script that modifies files; PRs are opened automatically
   python scripts/repo_manager.py run-script ./bump-sphinx.sh \
       -m "Bump sphinx pin"
+
+  # Clone every repo to a persistent dir for hand-edits
+  python scripts/repo_manager.py checkout-all
+
+  # Commit and PR everything you edited under that dir
+  python scripts/repo_manager.py make-prs \
+      --dir /tmp/iati-docs-XXXX -m "Refactor X across the estate"
 
 sync
 ~~~~
@@ -82,6 +89,30 @@ The script contract:
 * Per-repo timeout: 5 minutes.
 
 Pass ``--include-template`` to also run against ``iati-docs-base``. Even when the script modifies files in the template, those changes are reported but not pushed - the template is treated as the source of truth and is never modified by this tool.
+
+checkout-all + make-prs
+~~~~~~~~~~~~~~~~~~~~~~~
+
+For refactors that don't fit a template-sync or a single script - things you need to look at, think about, and edit by hand across the estate - use the two-step manual flow.
+
+``checkout-all`` clones every tagged repo (plus the template) into a fresh ``/tmp/iati-docs-…`` directory, creates a working branch (default ``iati-docs-management/refactor-<timestamp>``) in each, and exits without cleanup. The directory persists until macOS reaps ``/tmp`` (after roughly three days of inactivity), which is plenty of time to either land PRs or discard the work.
+
+You then edit files in those checkouts however you like - by hand, in your editor, with whatever tools fit the task.
+
+When you're done, ``make-prs --dir <path> -m "<message>"`` walks each checkout, stages anything dirty, commits with the supplied message, pushes the working branch, and opens a pull request against the repo's default branch. Repos with nothing to publish (clean tree, no commits ahead of the default) are skipped. The branch name is detected from the first checkout unless ``--branch-name`` is given; all checkouts must be on the same branch.
+
+.. code-block:: bash
+
+  # Step 1: clone everything; note the printed work dir
+  python scripts/repo_manager.py checkout-all
+
+  # Step 2: edit files in the checkouts (by hand, with $EDITOR, etc.)
+
+  # Step 3: commit and PR everything you changed
+  python scripts/repo_manager.py make-prs \
+      --dir /tmp/iati-docs-XXXX -m "Drop legacy myst extensions"
+
+The template checkout is included so you can use it as a reference while editing. ``make-prs`` ignores it - the template is never published to via this tool.
 
 Example - inspection: report which repos use ``myst_parser``. The script always exits ``0`` and reports findings via stdout; exit codes can't be used to signal "no match" because non-zero would abort the run.
 
