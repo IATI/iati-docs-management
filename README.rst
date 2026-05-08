@@ -5,7 +5,7 @@ iati-docs-management: Docs and tools for developing & maintaining IATI documenta
 This repo serves two purposes:
 
 1. It hosts a Sphinx site (under ``docs/``) with guidance for maintaining IATI documentation sites.
-2. It provides tooling (under ``scripts/``) for managing the fleet of IATI documentation repositories as a group.
+2. It provides tooling (under ``scripts/``) for managing the estate of IATI documentation repositories as a group.
 
 See also `iati-docs-base <https://github.com/IATI/iati-docs-base>`_ - the template repo that all IATI docs sites are derived from. ``iati-docs-base`` is treated as the authoritative source of truth by the tooling in this repo.
 
@@ -14,58 +14,117 @@ Repository layout
 
 * ``docs/`` - the Sphinx documentation site (maintainer guidance for IATI docs sites).
 * ``scripts/`` - reusable tooling for working across all IATI documentation repos.
-* ``example-scripts/`` - one-off scripts kept for reference after use.
+* ``example-scripts/`` - a parking spot for one-off scripts to keep around for reference after use.
 
 Many of the scripts rely on the `gh <https://cli.github.com/>`_ command-line tool; ensure it is installed and authenticated against the ``IATI`` org before running them.
 
-Managing the documentation fleet
-================================
+Managing the documentation estate
+=================================
 
-IATI documentation repos are identified by a GitHub `custom repository property <https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/managing-custom-properties-for-repositories-in-your-organization>`_ named ``Documentation`` set to ``true``. The tooling in ``scripts/`` uses this property to discover the fleet, so any new docs site must be tagged before it will be picked up.
+IATI documentation repos are identified by a GitHub `custom repository property <https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/managing-custom-properties-for-repositories-in-your-organization>`_ named ``Documentation`` set to ``true``. The tooling in ``scripts/`` uses this property to discover the estate, so any new docs site must be tagged before it will be picked up.
 
 scripts/repo_manager.py
 -----------------------
 
-A Python 3.13 CLI for performing checks and updates across every Documentation-tagged repo, using ``iati-docs-base`` as the template. All mutating commands run in **dry-run mode by default** - pass ``--apply`` to actually make changes.
+A Python 3.13 CLI with four commands for working across every Documentation-tagged repo, using ``iati-docs-base`` as the template. Anything outside this scope - one-off fixes, ad-hoc edits to a single repo - should be done by hand on a single branch, not via this tool.
 
 .. code-block:: bash
 
   # List every Documentation-tagged repo
   python scripts/repo_manager.py list
 
-  # Check each repo's shared files against the template, with diffs
+  # Show which repos diverge from the template, with diffs
   python scripts/repo_manager.py check
 
-  # Show what would be synced from the template (dry run)
-  python scripts/repo_manager.py sync
+  # Dry run: show what would be synced, committed, and PR'd
+  python scripts/repo_manager.py sync -m "Sync from template"
 
-  # Actually copy template files into each checkout
-  python scripts/repo_manager.py sync --apply
+  # Actually push branches and open PRs against each repo's default branch
+  python scripts/repo_manager.py sync -m "Sync from template" --apply
 
-  # Commit and push any local changes across the fleet
-  python scripts/repo_manager.py push -m "Sync from template" --apply
+  # Run an inspection script in each repo (no changes -> no PRs)
+  python scripts/repo_manager.py run-script ./find-myst-parser.sh
 
-  # Run an arbitrary script in each repo (repo name is passed as argv[1])
-  python scripts/repo_manager.py run-script ./my-script.sh --apply
+  # Run a script that modifies files; PRs are opened automatically
+  python scripts/repo_manager.py run-script ./bump-sphinx.sh \
+      -m "Bump sphinx pin"
+
+sync
+~~~~
+
+Performs the full template-sync flow per repo: copy template files, commit on a fresh working branch (default ``iati-docs-management/sync-<timestamp>``), push, and open a pull request against the repo's default branch. It never commits to ``main`` - a defence-in-depth check refuses to operate if the working tree somehow ends up on the default branch. Override the branch name with ``--branch-name`` and the PR body with ``--pr-body``.
 
 By default, ``check`` and ``sync`` operate on:
 
 * ``.readthedocs.yaml``
-* ``requirements.txt``
+* ``requirements.in`` and ``requirements_dev.in`` (the canonical pip-compile inputs)
+* ``requirements.txt`` (tracked but expected to drift)
 * ``.github/workflows/ci.yml``
 * ``.vscode/launch.json``
 
-Use ``--files`` on either command to override that list.
+For most files, a difference from the template is interesting - it usually means something significant has changed. ``requirements.txt`` is the exception: it's regenerated by pip-compile and developers update it locally as part of normal work, so it drifts naturally. ``check`` shows it as ``DIFFERS (expected)`` and suppresses the diff body, while still reporting genuine problems (a missing file, a missing template). Use ``--files`` on either command to override the default list.
 
-Each invocation clones every tagged repo (plus the template) into a temporary directory that is cleaned up when the command exits, so there is no persistent local state to manage.
+run-script
+~~~~~~~~~~
 
-For more complex checks or syncs, ``RepoManager`` exposes ``run_custom_check`` and ``run_custom_sync`` which accept a callable to run against each checkout. See ``example_check_python_version`` and ``example_sync_gitignore`` in ``scripts/repo_manager.py`` for the expected shape.
+Runs an arbitrary script in each repo. Behaviour is determined by what the script does:
+
+* **No filesystem changes anywhere**: the run is purely informational. stdout/stderr from each repo is shown; nothing is committed or pushed. Use this for inspection questions like *"which repos use this plugin"* or *"which repos contain this file"*.
+* **Filesystem changes in one or more repos**: the changes are committed on a fresh working branch (``iati-docs-management/script-<script-stem>-<timestamp>``) and opened as PRs against each repo's default branch. ``-m MSG`` must be provided in this case (the tool will refuse to publish without one) and is used as both the commit message and PR title.
+* **Non-zero exit, timeout, or invocation error in any repo**: the whole run aborts immediately. No further repos are processed and nothing is published, even from repos that succeeded earlier. Investigate the failure before re-running.
+
+The script contract:
+
+* Invoked as ``<script> <repo-name>``.
+* ``cwd`` is set to the repo's checkout.
+* The script must be executable (``chmod +x``) and have a shebang.
+* The script must exit ``0`` on success - any non-zero exit aborts the entire estate-wide run.
+* stdout, stderr, exit code, and the list of changed files are captured and displayed for each repo.
+* Per-repo timeout: 5 minutes.
+
+Pass ``--include-template`` to also run against ``iati-docs-base``. Even when the script modifies files in the template, those changes are reported but not pushed - the template is treated as the source of truth and is never modified by this tool.
+
+Example - inspection: report which repos use ``myst_parser``. The script always exits ``0`` and reports findings via stdout; exit codes can't be used to signal "no match" because non-zero would abort the run.
+
+.. code-block:: bash
+
+  #!/bin/bash
+  # find-myst-parser.sh - prints how many myst_parser refs each repo has
+  set -e
+  if [ -f requirements.txt ] && grep -q "myst_parser" requirements.txt; then
+      count=$(grep -c "myst_parser" requirements.txt)
+      echo "found $count reference(s)"
+  else
+      echo "not used"
+  fi
+
+Example - publishing: bump a pinned dependency in ``requirements.txt``:
+
+.. code-block:: bash
+
+  #!/bin/bash
+  # bump-sphinx.sh - upgrade sphinx pin
+  set -e
+  if [ -f requirements.txt ]; then
+      sed -i.bak 's/^sphinx==.*/sphinx==7.4.0/' requirements.txt
+      rm requirements.txt.bak
+  fi
+
+Storage and cleanup
+~~~~~~~~~~~~~~~~~~~
+
+Each invocation clones every tagged repo (plus the template) into a session directory under ``/tmp`` that is cleaned up when the command exits. Anything left behind is reaped by the OS's periodic ``/tmp`` cleanup.
+
+Python API
+~~~~~~~~~~
+
+For complex checks or syncs that don't fit the CLI, ``RepoManager`` exposes ``run_custom_check`` and ``run_custom_sync`` which accept a callable to run against each checkout. See ``example_check_python_version`` and ``example_sync_gitignore`` in ``scripts/repo_manager.py`` for the expected shape.
 
 Other scripts
 -------------
 
 * ``scripts/list_all_docs_repos.sh`` - print every repo currently tagged ``Documentation=true``.
-* ``scripts/find_untagged_repos.sh`` - print repos with "docs" in the name that are *not* tagged. Useful for spotting docs sites that need onboarding into the fleet.
+* ``scripts/find_untagged_repos.sh`` - print repos with "docs" in the name that are *not* tagged. Useful for spotting docs sites that need onboarding into the estate.
 
 Building this site's documentation
 ==================================
