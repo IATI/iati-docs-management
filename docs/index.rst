@@ -1,8 +1,11 @@
-******************
-IATI Documentation
-******************
+*****************************
+IATI Documentation Management
+*****************************
 
-This file is where your documentation goes. 
+GitHub
+------
+
+All documentation websites should have the `Documentation` custom property set to `true`. 
 
 .. toctree::
     :hidden:
