@@ -103,6 +103,7 @@ class RepoManager:
                 "gh",
                 "api",
                 f"/orgs/{GITHUB_ORG}/properties/values",
+                "--paginate",
                 "--jq",
                 '.[] | select(.properties[] | select(.property_name == "Documentation" and .value == "true")) | .repository_name',
             ],
