@@ -273,6 +273,38 @@ class RepoManager:
 
         return results
 
+    def extra_top_level_paths(self, repo: RepoCheckout) -> list[str]:
+        """
+        Top-level entries (files and directories) in the repo that don't
+        exist at the same path in the template. ``.git`` is excluded.
+
+        Reported for information only. The tooling never modifies these -
+        they're a hint that a downstream repo has something the template
+        doesn't, which may be deliberate (e.g. ``.yamllint.yaml`` for local
+        linting, ``package.json`` for an auxiliary toolchain) or may be drift
+        worth investigating. Use the human-decision verbs (``checkout-all``
+        + ``make-prs``) if any of them turn out to need action.
+        """
+        if self.template is None:
+            raise ValueError("Template repo not checked out")
+
+        template_entries = {p.name for p in self.template.path.iterdir()}
+        extras = []
+        for entry in sorted(repo.path.iterdir(), key=lambda p: p.name):
+            if entry.name == ".git":
+                continue
+            if entry.name in template_entries:
+                continue
+            extras.append(entry.name)
+        return extras
+
+    def extra_paths_all_repos(self) -> dict[str, list[str]]:
+        """
+        Run ``extra_top_level_paths`` for every checked-out repo.
+        Returns a dict mapping repo name to its list of extras.
+        """
+        return {repo.name: self.extra_top_level_paths(repo) for repo in self.repos}
+
     def run_custom_check(
         self, check_func: Callable[[RepoCheckout, "RepoManager"], dict]
     ) -> dict[str, dict]:
@@ -1360,6 +1392,29 @@ def print_results(results: dict, title: str, show_diff: bool = True) -> None:
                     print(f"  {key}: {value}")
 
 
+def print_extra_paths(extras: dict[str, list[str]]) -> None:
+    """
+    Print top-level paths found in each repo that don't exist in the
+    template. Skips repos with nothing to report.
+    """
+    repos_with_extras = {name: paths for name, paths in extras.items() if paths}
+    if not repos_with_extras:
+        return
+
+    print(f"\n{'=' * 60}")
+    print(" EXTRA TOP-LEVEL PATHS (in repo, not in template)")
+    print("=" * 60)
+    print(
+        "\nReported for information only - the tooling never touches these."
+        "\nThey may be deliberate per-repo additions (local linter config,"
+        "\nauxiliary toolchains) or drift worth investigating."
+    )
+    for repo_name, paths in repos_with_extras.items():
+        print(f"\n{repo_name}:")
+        for p in paths:
+            print(f"  - {p}")
+
+
 def print_run_script_results(results: dict, title: str) -> None:
     """Pretty print run-script results: repo, exit code, stdout, stderr."""
     print(f"\n{'=' * 60}")
@@ -1994,6 +2049,9 @@ def main():
         if args.command == "check":
             results = manager.check_all_repos(args.files)
             print_results(results, "CHECK RESULTS", show_diff=not args.no_diff)
+
+            extras = manager.extra_paths_all_repos()
+            print_extra_paths(extras)
 
             # Summary
             total_files = sum(len(r) for r in results.values())
