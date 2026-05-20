@@ -840,9 +840,7 @@ class RepoManager:
             env=env,
         )
         result["build_exit_code"] = build_proc.returncode
-        result["build_stderr_tail"] = "\n".join(
-            build_proc.stderr.splitlines()[-30:]
-        )
+        result["build_stderr_tail"] = "\n".join(build_proc.stderr.splitlines()[-30:])
         # Sphinx writes warnings to stderr in the form
         # "/path/file.rst:N: WARNING: ..." - keep just those lines, and
         # strip the absolute repo path so warnings produced from two
@@ -861,8 +859,7 @@ class RepoManager:
 
         if html_dir.is_dir():
             result["pages"] = sorted(
-                str(p.relative_to(html_dir))
-                for p in html_dir.rglob("*.html")
+                str(p.relative_to(html_dir)) for p in html_dir.rglob("*.html")
             )
             result["html_dir"] = str(html_dir)
 
@@ -899,8 +896,7 @@ class RepoManager:
         """
         if not self.repos and self.template is None:
             raise ValueError(
-                "No repos checked out. Call checkout_all() before "
-                "build_all_repos()."
+                "No repos checked out. Call checkout_all() before " "build_all_repos()."
             )
 
         repos_to_build = list(self.repos)
@@ -1372,12 +1368,8 @@ def print_build_compare(comparison: dict) -> None:
     # sections may be empty or misleading. Don't suppress them; the
     # operator may still want to see partial output.
     if candidate["failed"] and not baseline["failed"]:
-        print(
-            f"\n  Candidate build did not complete (stage: {candidate['stage']})."
-        )
-        print(
-            f"  Reason: {candidate.get('failure_reason', 'unknown')}"
-        )
+        print(f"\n  Candidate build did not complete (stage: {candidate['stage']}).")
+        print(f"  Reason: {candidate.get('failure_reason', 'unknown')}")
         tail = candidate.get("build_stderr_tail") or candidate.get(
             "install_stderr_tail"
         )
