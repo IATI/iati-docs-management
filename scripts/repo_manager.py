@@ -11,6 +11,7 @@ scripts in each repo.
 
 import datetime
 import difflib
+import os
 import re
 import shutil
 import subprocess
@@ -502,7 +503,7 @@ class RepoManager:
         return result.stdout.strip()
 
     @staticmethod
-    def _default_branch(repo_path: Path) -> str:
+    def default_branch(repo_path: Path) -> str:
         """Return the upstream default branch name (e.g. 'main')."""
         result = subprocess.run(
             ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
@@ -522,7 +523,7 @@ class RepoManager:
         manually switched branches between checkout and publish.
         """
         current = self._current_branch(repo.path)
-        default = self._default_branch(repo.path)
+        default = self.default_branch(repo.path)
         if not current or current == default or current in ("main", "master"):
             raise RuntimeError(
                 f"Refusing to operate on branch {current!r} in {repo.name} "
@@ -611,7 +612,7 @@ class RepoManager:
         """
         self._ensure_safe_branch(repo)
 
-        default = self._default_branch(repo.path)
+        default = self.default_branch(repo.path)
         result = {
             "repo": repo.name,
             "branch": self.branch_name,
@@ -722,17 +723,23 @@ class RepoManager:
     @staticmethod
     def build_repo(repo: RepoCheckout, python_executable: str | None = None) -> dict:
         """
-        Build a repo's Sphinx docs in a fresh venv inside the checkout.
+        Build a repo's Sphinx docs in a fresh venv in an external scratch dir.
 
-        The venv is created at ``<repo>/.venv-build``. ``requirements.txt`` is
-        installed from the repo (which pins the same Sphinx / theme versions
-        ReadTheDocs uses). The build is invoked from the ``docs/`` directory
-        with ``python -m sphinx -b dirhtml . _build/html`` - matching the
-        repo's Makefile convention so any conf.py imports of sibling modules
-        (``from project_info import ...``) resolve.
+        The venv and Sphinx output both live in a scratch directory under
+        ``/tmp/iati-build-<repo>-<rand>/`` - never inside the repo. This
+        keeps the candidate's working tree untouched even when the caller
+        passes a local checkout (e.g. via ``build-compare --dir``).
 
-        Any existing ``docs/_build/`` is removed first so the resulting page
-        list reflects this build alone.
+        ``requirements.txt`` is installed from the repo (which pins the same
+        Sphinx / theme versions ReadTheDocs uses). The build is invoked from
+        the ``docs/`` directory so any conf.py imports of sibling modules
+        (``from project_info import ...``) resolve. ``PYTHONDONTWRITEBYTECODE``
+        is set on the build subprocess so importing conf.py doesn't leave
+        ``__pycache__`` in the repo's ``docs/``.
+
+        Scratch directories are NOT cleaned up. macOS prunes ``/tmp`` files
+        older than ~3 days, which is plenty of time to inspect a failed
+        build manually.
 
         Args:
             repo: A checked-out repo.
@@ -747,8 +754,11 @@ class RepoManager:
                 install_exit_code, install_stderr_tail
                 build_exit_code, build_stderr_tail
                 pages: sorted list of HTML pages produced
-                  (paths relative to docs/_build/html, empty if build failed)
+                  (paths relative to html_dir, empty if build failed)
                 warnings: list of Sphinx warning lines from stderr
+                scratch_dir: path to the build scratch dir
+                html_dir: path to the directory containing the built HTML
+                  (only set on a successful build)
         """
         if python_executable is None:
             python_executable = sys.executable
@@ -773,15 +783,13 @@ class RepoManager:
             result["failure_reason"] = f"No requirements.txt in {repo.name}"
             return result
 
-        venv_path = repo.path / ".venv-build"
-        if venv_path.exists():
-            shutil.rmtree(venv_path)
-        build_dir = docs_dir / "_build"
-        if build_dir.exists():
-            shutil.rmtree(build_dir)
+        scratch_dir = Path(
+            tempfile.mkdtemp(prefix=f"iati-build-{repo.name}-", dir="/tmp")
+        )
+        result["scratch_dir"] = str(scratch_dir)
+        venv_path = scratch_dir / "venv"
+        html_dir = scratch_dir / "html"
 
-        # Create venv. Use --without-pip-extras to skip unneeded ensurepip
-        # extras; the bootstrapping pip is enough to install requirements.
         venv_proc = subprocess.run(
             [python_executable, "-m", "venv", str(venv_path)],
             capture_output=True,
@@ -813,6 +821,9 @@ class RepoManager:
             return result
 
         result["stage"] = "build"
+        # PYTHONDONTWRITEBYTECODE keeps Python from leaving __pycache__/
+        # in the repo's docs/ when Sphinx imports conf.py and project_info.
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
         build_proc = subprocess.run(
             [
                 str(py_path),
@@ -821,11 +832,12 @@ class RepoManager:
                 "-b",
                 "dirhtml",
                 ".",
-                "_build/html",
+                str(html_dir),
             ],
             cwd=docs_dir,
             capture_output=True,
             text=True,
+            env=env,
         )
         result["build_exit_code"] = build_proc.returncode
         result["build_stderr_tail"] = "\n".join(
@@ -847,15 +859,66 @@ class RepoManager:
             result["failure_reason"] = "sphinx build failed"
             return result
 
-        html_dir = build_dir / "html"
         if html_dir.is_dir():
             result["pages"] = sorted(
                 str(p.relative_to(html_dir))
                 for p in html_dir.rglob("*.html")
             )
+            result["html_dir"] = str(html_dir)
 
         result["stage"] = "complete"
         return result
+
+    def build_all_repos(self, include_template: bool = True) -> dict[str, dict]:
+        """
+        Build every checked-out repo at its default branch.
+
+        Precondition: ``checkout_all`` (or repeated ``checkout_repo``) must
+        have been called first. This method reads from ``self.repos`` and
+        ``self.template``; it does not clone anything itself.
+
+        Each repo is switched to its default branch before building so the
+        measured state reflects the upstream head rather than the working
+        branch ``checkout_all`` creates. The working branch is not
+        restored - the checkouts are intended to be thrown away after
+        ``cleanup()``.
+
+        Args:
+            include_template: Whether to also build the template repo if
+                one is checked out. Defaults to True - an estate-wide
+                health snapshot normally wants to confirm the template
+                itself builds.
+
+        Returns:
+            Dict mapping repo names to ``build_repo`` result dicts. Order
+            puts the template (if included) first, then ``self.repos`` in
+            the order they were checked out.
+
+        Raises:
+            ValueError: If no repos have been checked out yet.
+        """
+        if not self.repos and self.template is None:
+            raise ValueError(
+                "No repos checked out. Call checkout_all() before "
+                "build_all_repos()."
+            )
+
+        repos_to_build = list(self.repos)
+        if include_template and self.template is not None:
+            repos_to_build.insert(0, self.template)
+
+        results: dict[str, dict] = {}
+        for repo in repos_to_build:
+            default = self.default_branch(repo.path)
+            subprocess.run(
+                ["git", "checkout", default],
+                cwd=repo.path,
+                check=True,
+                capture_output=True,
+            )
+            print(f"Building {repo.name}...")
+            results[repo.name] = self.build_repo(repo)
+        return results
 
     @staticmethod
     def _normalise_html(content: str) -> str:
@@ -869,35 +932,29 @@ class RepoManager:
         baseline_html: str,
         candidate_html: str,
         page_name: str,
-        max_lines: int = 80,
     ) -> str | None:
         """
         Unified diff of two HTML pages after normalisation, or None if they
-        are identical post-normalisation. Diff is capped at ``max_lines``
-        with a ``... (N more)`` tail.
+        are identical post-normalisation. The diff is returned in full -
+        the operator ran build-compare to see what changed, and truncating
+        hides exactly the signal they asked for.
         """
         baseline_norm = RepoManager._normalise_html(baseline_html).splitlines()
         candidate_norm = RepoManager._normalise_html(candidate_html).splitlines()
         if baseline_norm == candidate_norm:
             return None
-        diff_lines = list(
-            difflib.unified_diff(
-                baseline_norm,
-                candidate_norm,
-                fromfile=f"baseline/{page_name}",
-                tofile=f"candidate/{page_name}",
-                n=2,
-                lineterm="",
-            )
+        diff_lines = difflib.unified_diff(
+            baseline_norm,
+            candidate_norm,
+            fromfile=f"baseline/{page_name}",
+            tofile=f"candidate/{page_name}",
+            n=2,
+            lineterm="",
         )
-        if len(diff_lines) > max_lines:
-            kept = diff_lines[:max_lines]
-            kept.append(f"... ({len(diff_lines) - max_lines} more diff lines)")
-            return "\n".join(kept)
         return "\n".join(diff_lines)
 
+    @staticmethod
     def build_compare(
-        self,
         candidate_repo: RepoCheckout,
         baseline_ref: str = "main",
         python_executable: str | None = None,
@@ -935,14 +992,33 @@ class RepoManager:
                 baseline_scratch: where the baseline clone lives, for manual
                     deeper inspection
         """
+        clone_url = f"https://github.com/{GITHUB_ORG}/{candidate_repo.name}.git"
+
+        # Validate the baseline ref before doing any build work. ``git clone
+        # --depth 1 --branch`` only accepts branch and tag refs, not commit
+        # SHAs - and our error message is clearer than git's "Remote branch
+        # <ref> not found in upstream origin". Doing this up front avoids
+        # ~30s of wasted candidate build on a typo.
+        ls_remote = subprocess.run(
+            ["git", "ls-remote", "--heads", "--tags", clone_url, baseline_ref],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if not ls_remote.stdout.strip():
+            raise ValueError(
+                f"Baseline ref {baseline_ref!r} is not a branch or tag in "
+                f"{candidate_repo.name}. --baseline-ref accepts branch and "
+                f"tag names only; commit SHAs are not supported."
+            )
+
         print(f"Building candidate ({candidate_repo.name})...")
-        candidate_result = self.build_repo(candidate_repo, python_executable)
+        candidate_result = RepoManager.build_repo(candidate_repo, python_executable)
 
         baseline_scratch = Path(
             tempfile.mkdtemp(prefix=f"iati-baseline-{candidate_repo.name}-", dir="/tmp")
         )
         baseline_path = baseline_scratch / candidate_repo.name
-        clone_url = f"https://github.com/{GITHUB_ORG}/{candidate_repo.name}.git"
         print(f"Cloning baseline ({baseline_ref})...")
         subprocess.run(
             [
@@ -960,29 +1036,34 @@ class RepoManager:
         )
         baseline_repo = RepoCheckout(name=candidate_repo.name, path=baseline_path)
         print(f"Building baseline ({baseline_ref})...")
-        baseline_result = self.build_repo(baseline_repo, python_executable)
+        baseline_result = RepoManager.build_repo(baseline_repo, python_executable)
 
-        try:
-            head = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=candidate_repo.path,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
-            candidate_label = head if head and head != "HEAD" else "candidate"
-        except subprocess.CalledProcessError:
-            candidate_label = "candidate"
+        candidate_label = (
+            RepoManager._current_branch(candidate_repo.path) or "candidate"
+        )
 
         baseline_pages = set(baseline_result.get("pages", []))
         candidate_pages = set(candidate_result.get("pages", []))
         pages_added = sorted(candidate_pages - baseline_pages)
         pages_removed = sorted(baseline_pages - candidate_pages)
 
-        baseline_html_dir = baseline_repo.path / "docs" / "_build" / "html"
-        candidate_html_dir = candidate_repo.path / "docs" / "_build" / "html"
+        # Both sides only have html_dir set if the build actually succeeded.
+        # If either failed, skip the per-page diff (the warnings/pages_added
+        # sections still carry signal).
+        baseline_html_dir = (
+            Path(baseline_result["html_dir"])
+            if baseline_result.get("html_dir")
+            else None
+        )
+        candidate_html_dir = (
+            Path(candidate_result["html_dir"])
+            if candidate_result.get("html_dir")
+            else None
+        )
         pages_modified: dict[str, str] = {}
         for page in sorted(baseline_pages & candidate_pages):
+            if baseline_html_dir is None or candidate_html_dir is None:
+                break
             baseline_file = baseline_html_dir / page
             candidate_file = candidate_html_dir / page
             if not baseline_file.is_file() or not candidate_file.is_file():
@@ -992,7 +1073,7 @@ class RepoManager:
                 candidate_html = candidate_file.read_text(errors="replace")
             except OSError:
                 continue
-            diff = self._page_diff(baseline_html, candidate_html, page)
+            diff = RepoManager._page_diff(baseline_html, candidate_html, page)
             if diff is not None:
                 pages_modified[page] = diff
 
@@ -1359,7 +1440,13 @@ def print_build_compare(comparison: dict) -> None:
     if nothing_changed and not candidate["failed"]:
         print("\n  No differences detected.")
 
-    print(f"\n  Baseline checkout (for further inspection): {comparison['baseline_scratch']}")
+    # Only advertise the scratch checkout when there's actually something
+    # to inspect. macOS prunes /tmp eventually either way.
+    if not nothing_changed or candidate["failed"]:
+        print(
+            f"\n  Baseline checkout (for further inspection): "
+            f"{comparison['baseline_scratch']}"
+        )
 
 
 def main():
@@ -1600,16 +1687,38 @@ def main():
 
     args = parser.parse_args()
 
+    if args.command is None:
+        parser.print_help()
+        return
+
+    # Every command in this tool depends on gh - either to enumerate the
+    # Documentation-tagged estate or to push branches and open PRs. Fail
+    # fast with a clear message if it isn't installed or authenticated,
+    # rather than letting the failure surface mid-run as a noisy
+    # CalledProcessError from a subprocess deep in the call stack.
+    try:
+        auth_check = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        parser.error(
+            "gh CLI is not installed. Install from https://cli.github.com/ "
+            "and run `gh auth login`."
+        )
+    if auth_check.returncode != 0:
+        parser.error(
+            "gh CLI is not authenticated for the IATI org. Run "
+            "`gh auth login` and try again."
+        )
+
     if args.command == "list":
         repos = RepoManager.get_tagged_repos()
         print("Documentation repositories:")
         for repo in repos:
             marker = " (template)" if repo == TEMPLATE_REPO else ""
             print(f"  - {repo}{marker}")
-        return
-
-    if args.command is None:
-        parser.print_help()
         return
 
     if args.command == "checkout-all":
@@ -1639,7 +1748,7 @@ def main():
             checkout = manager.checkout_repo(args.repo)
             # checkout_repo creates a working branch; switch back to the
             # default so we build the same code that's on main.
-            default = RepoManager._default_branch(checkout.path)
+            default = RepoManager.default_branch(checkout.path)
             subprocess.run(
                 ["git", "checkout", default],
                 cwd=checkout.path,
@@ -1655,25 +1764,7 @@ def main():
             print(f"Working directory: {manager.work_dir}")
             print("Checking out repositories...")
             manager.checkout_all(include_template=True)
-
-            # Build on each repo's default branch (not the working branch
-            # checkout_repo just created). We're measuring upstream state.
-            all_repos = [*manager.repos]
-            if manager.template:
-                all_repos.insert(0, manager.template)
-
-            results = {}
-            for repo in all_repos:
-                default = RepoManager._default_branch(repo.path)
-                subprocess.run(
-                    ["git", "checkout", default],
-                    cwd=repo.path,
-                    check=True,
-                    capture_output=True,
-                )
-                print(f"\nBuilding {repo.name}...")
-                results[repo.name] = manager.build_repo(repo)
-
+            results = manager.build_all_repos()
             print_build_all_results(results)
             failures = [r for r in results.values() if r["failed"]]
             return 1 if failures else 0
@@ -1684,7 +1775,9 @@ def main():
             parser.error(f"--dir {candidate_path} is not a git checkout")
 
         # Infer the repo name from the origin remote so we know what to
-        # clone for the baseline. Falls back to the directory name.
+        # clone for the baseline. Falls back to the directory name if the
+        # remote can't be read.
+        origin: str | None = None
         try:
             origin = subprocess.run(
                 ["git", "remote", "get-url", "origin"],
@@ -1698,9 +1791,30 @@ def main():
         except subprocess.CalledProcessError:
             repo_name = candidate_path.name
 
+        # Cross-check against the tagged estate. The baseline is always
+        # cloned from IATI/<repo>, so if the name isn't in the tagged set
+        # the clone will 404. Failing fast here gives a clearer message
+        # and surfaces the "repo exists but isn't tagged Documentation=true"
+        # case explicitly.
+        tagged = RepoManager.get_tagged_repos()
+        if repo_name not in tagged:
+            source = origin if origin else f"directory name {candidate_path.name!r}"
+            parser.error(
+                f"Repo {repo_name!r} (inferred from {source}) is not in the "
+                f"Documentation-tagged estate. Either:\n"
+                f"  * --dir points at a checkout that isn't an IATI docs repo, or\n"
+                f"  * the upstream repo exists but isn't tagged Documentation=true "
+                f"(use `list` to see what is).\n"
+                f"Baselines are always cloned from IATI/<repo> on github.com."
+            )
+
         candidate = RepoCheckout(name=repo_name, path=candidate_path)
-        manager = RepoManager()
-        comparison = manager.build_compare(candidate, baseline_ref=args.baseline_ref)
+        try:
+            comparison = RepoManager.build_compare(
+                candidate, baseline_ref=args.baseline_ref
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
         print_build_compare(comparison)
         # Exit code is mechanical: only flag failure when the candidate
         # itself failed to build while the baseline succeeded. Content
