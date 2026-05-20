@@ -88,6 +88,26 @@ both treat any divergence as drift the downstream needs to converge on. If
 a downstream needs to permanently differ from the template, that's a signal
 to update the template, not to special-case the downstream.
 
+### The template is a baseline, not a whitelist
+
+The template defines what every repo **must have in common**. It does
+**not** define an exhaustive list of files that are allowed to exist. A
+downstream repo can legitimately have extras: a `.yamllint.yaml` someone
+runs locally, a `package.json` for a diagram-rendering toolchain, a
+`Makefile` for repo-specific shortcuts. Never delete a file from a
+downstream just because the template doesn't have it — that's the
+inverted-default mistake.
+
+The lesson came from the iati-unified-platform-docs migration: a
+`.yamllint.yaml` got removed during the "match the template" pass, only
+to be restored after we realised it was being used locally and the
+deletion silently broke someone's editor workflow.
+
+To surface this without acting on it, `check` ends with an **EXTRA
+TOP-LEVEL PATHS** section listing per-repo files and directories that
+exist in the repo but not the template. It's a hint, not a worklist;
+the tooling never touches those paths.
+
 ### Three flavours of cross-repo change
 
 - **Template sync** (`sync`) — files identical across repos. PR per repo, all
