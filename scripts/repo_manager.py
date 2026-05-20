@@ -671,6 +671,81 @@ class RepoManager:
 
         return result
 
+    @staticmethod
+    def format_with_black(repo: RepoCheckout) -> dict:
+        """
+        Run black across a repo's tree, auto-fixing formatting.
+
+        Reformatting changes are left in the working tree for a subsequent
+        commit to pick up - same as if a contributor had run black before
+        committing. Black's version is whichever one is installed for the
+        Python running this script; that matches CI because every repo's
+        ``requirements_dev.in`` pins the same black via template sync.
+
+        Black exits non-zero only when it can't parse the source (i.e. a
+        real syntax error). That's the one case where the caller should
+        abort the publish rather than continue: silently auto-fixing
+        formatting is fine, silently dropping unparseable code on the
+        floor is not.
+
+        Args:
+            repo: The repo to format.
+
+        Returns:
+            Dict with:
+                exit_code: black's exit code (0 = clean or reformatted OK)
+                failed: True if black couldn't run or couldn't parse the
+                  source
+                failure_reason: human-readable explanation if failed
+                changed_files: list of file paths black reformatted
+                  (from black's stderr; relative to wherever black logged)
+                stderr_tail: last ~20 lines of black stderr
+        """
+        result: dict = {"repo": repo.name, "failed": False, "changed_files": []}
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "black", str(repo.path)],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            result["failed"] = True
+            result["failure_reason"] = (
+                f"Python interpreter not found at {sys.executable!r}."
+            )
+            return result
+
+        result["exit_code"] = proc.returncode
+        result["stderr_tail"] = "\n".join(proc.stderr.splitlines()[-20:])
+
+        # Detect missing black before treating the non-zero as a parse error.
+        if "No module named" in proc.stderr and "black" in proc.stderr:
+            result["failed"] = True
+            result["failure_reason"] = (
+                f"black is not installed for {sys.executable}. "
+                "Install this repo's requirements_dev.txt and try again."
+            )
+            return result
+
+        if proc.returncode != 0:
+            result["failed"] = True
+            result["failure_reason"] = (
+                f"black exited {proc.returncode} - usually a syntax error "
+                "in the source. See stderr_tail."
+            )
+            return result
+
+        # Lines on stderr like "reformatted /path/to/file.py" tell us what
+        # changed. The summary line "N files reformatted." also appears
+        # but we don't need it.
+        result["changed_files"] = [
+            line.removeprefix("reformatted ").strip()
+            for line in proc.stderr.splitlines()
+            if line.startswith("reformatted ")
+        ]
+        return result
+
     def update_all_to_github(
         self,
         commit_message: str,
@@ -682,14 +757,25 @@ class RepoManager:
         Commit changes and push the working branch in all repos, opening a
         pull request against the default branch.
 
+        Before committing, runs black across each repo and auto-fixes any
+        formatting. If black can't parse the source in any repo, the
+        entire estate-wide publish is aborted - no PRs are opened. This
+        prevents the common failure of opening PRs that immediately fail
+        CI's ``black --check``.
+
         Args:
             commit_message: Message for commits.
             pr_title: PR title. Defaults to the commit message.
             pr_body: PR body. Defaults to a generated description.
-            dry_run: If True, only report what would be done.
+            dry_run: If True, only report what would be done. Black is
+                skipped on dry runs since it would modify files.
 
         Returns:
             Dict mapping repo names to update results.
+
+        Raises:
+            RuntimeError: If black fails (parse error or missing) in any
+                repo. No commits or pushes happen.
         """
         if pr_title is None:
             pr_title = commit_message
@@ -699,6 +785,32 @@ class RepoManager:
                 f"Branch: `{self.branch_name}`\n"
                 f"Commit: {commit_message}"
             )
+
+        # Format every repo with black before any commit. Run all repos
+        # before checking failures so the operator gets a complete picture
+        # of what's wrong rather than the first failure only.
+        if not dry_run:
+            format_results = {
+                repo.name: self.format_with_black(repo) for repo in self.repos
+            }
+            failures = [r for r in format_results.values() if r["failed"]]
+            if failures:
+                for r in failures:
+                    print(f"\n  {r['repo']}: {r['failure_reason']}")
+                    for line in r.get("stderr_tail", "").splitlines():
+                        print(f"    {line}")
+                raise RuntimeError(
+                    f"black failed in {len(failures)} repo(s); aborting publish. "
+                    "No commits or PRs were created."
+                )
+            total_reformatted = sum(
+                len(r["changed_files"]) for r in format_results.values()
+            )
+            if total_reformatted:
+                print(f"\nblack reformatted {total_reformatted} file(s):")
+                for name, r in format_results.items():
+                    if r["changed_files"]:
+                        print(f"  {name}: {len(r['changed_files'])} file(s)")
 
         results = {}
         for repo in self.repos:
