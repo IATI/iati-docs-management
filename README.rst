@@ -53,6 +53,15 @@ A Python 3.13 CLI for working across every Documentation-tagged repo, using ``ia
   python scripts/repo_manager.py make-prs \
       --dir /tmp/iati-docs-XXXX -m "Refactor X across the estate"
 
+  # Build one repo on main in a fresh venv (sanity check)
+  python scripts/repo_manager.py build iati-publisher-docs
+
+  # Build every repo on main; one-line summary per repo
+  python scripts/repo_manager.py build-all
+
+  # Did my edits break this checkout? Compare against main.
+  python scripts/repo_manager.py build-compare --dir /tmp/iati-docs-XXXX/iati-publisher-docs
+
 sync
 ~~~~
 
@@ -113,6 +122,24 @@ When you're done, ``make-prs --dir <path> -m "<message>"`` walks each checkout, 
       --dir /tmp/iati-docs-XXXX -m "Drop legacy myst extensions"
 
 The template checkout is included so you can use it as a reference while editing. ``make-prs`` ignores it - the template is never published to via this tool.
+
+build, build-all, build-compare
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Static checks (``check``) tell you if files match the template; the build verbs tell you if the docs actually still build. Every build happens in a fresh ``/tmp`` clone with a freshly-created ``.venv-build`` so the result reflects ``requirements.txt`` alone, not whatever's in your working environment.
+
+``build <repo>`` clones one repo at its default branch, installs ``requirements.txt``, runs ``sphinx-build``, and reports the exit code, warning count, and list of HTML pages produced. Use it as a one-off sanity check.
+
+``build-all`` does the same across every Documentation-tagged repo plus the template, with a one-line summary per repo (status, warning count, page count). Use it as an estate-wide health snapshot - especially before/after a template change.
+
+``build-compare --dir <path>`` is the tool for seeing the surface area of a change. It builds the candidate checkout as-is (uncommitted edits included; the working tree is never modified) and a fresh clone of the same repo at ``--baseline-ref`` (default ``main``), then reports:
+
+* pages added / removed / modified (with per-page normalised HTML diffs)
+* Sphinx warnings added / removed
+
+The report describes what differs; it doesn't adjudicate whether each difference is intended or problematic - that's the operator's call when rolling out an estate-wide change. Exit code is ``1`` only when the candidate failed to build while the baseline succeeded, so the verb fits into scripts as a build-health gate without falsely failing on intentional content changes. HTML diffs are normalised to strip Sphinx's ``?v=<hash>`` asset cache-busters; extend ``_HTML_NORMALISERS`` if a future theme version introduces another build-volatile pattern.
+
+Builds run from the repo's ``docs/`` directory (matching the Makefile / make.bat convention) so any ``from project_info import ...`` resolves. Invoking ``sphinx-build`` from the repo root instead will fail to import sibling modules; use these verbs (or the per-repo Makefile) and you'll never see that class of problem.
 
 Example - inspection: report which repos use ``myst_parser``. The script always exits ``0`` and reports findings via stdout; exit codes can't be used to signal "no match" because non-zero would abort the run.
 

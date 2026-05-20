@@ -10,12 +10,24 @@ scripts in each repo.
 """
 
 import datetime
+import difflib
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+# Patterns that vary between two builds of the same code and must be
+# normalised out before HTML pages are compared. Today the only known
+# offender is Sphinx's ``?v=<hash>`` asset cache-buster. Extend this list
+# if a future Sphinx/theme version introduces another build-volatile
+# value (e.g. timestamps in footers).
+_HTML_NORMALISERS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\?v=[0-9a-f]+"), "?v=NORM"),
+]
 
 # The authoritative template repo
 TEMPLATE_REPO = "iati-docs-base"
@@ -704,6 +716,314 @@ class RepoManager:
         return results
 
     # =========================================================================
+    # BUILD FUNCTIONS
+    # =========================================================================
+
+    @staticmethod
+    def build_repo(repo: RepoCheckout, python_executable: str | None = None) -> dict:
+        """
+        Build a repo's Sphinx docs in a fresh venv inside the checkout.
+
+        The venv is created at ``<repo>/.venv-build``. ``requirements.txt`` is
+        installed from the repo (which pins the same Sphinx / theme versions
+        ReadTheDocs uses). The build is invoked from the ``docs/`` directory
+        with ``python -m sphinx -b dirhtml . _build/html`` - matching the
+        repo's Makefile convention so any conf.py imports of sibling modules
+        (``from project_info import ...``) resolve.
+
+        Any existing ``docs/_build/`` is removed first so the resulting page
+        list reflects this build alone.
+
+        Args:
+            repo: A checked-out repo.
+            python_executable: Python interpreter to bootstrap the venv from.
+                Defaults to the interpreter running this script.
+
+        Returns:
+            Dict with structured build results:
+                stage: "install" or "build" or "complete"
+                failed: bool
+                failure_reason: str (if failed)
+                install_exit_code, install_stderr_tail
+                build_exit_code, build_stderr_tail
+                pages: sorted list of HTML pages produced
+                  (paths relative to docs/_build/html, empty if build failed)
+                warnings: list of Sphinx warning lines from stderr
+        """
+        if python_executable is None:
+            python_executable = sys.executable
+
+        result = {
+            "repo": repo.name,
+            "stage": "install",
+            "failed": False,
+            "pages": [],
+            "warnings": [],
+        }
+
+        docs_dir = repo.path / "docs"
+        if not docs_dir.is_dir():
+            result["failed"] = True
+            result["failure_reason"] = f"No docs/ directory in {repo.name}"
+            return result
+
+        requirements = repo.path / "requirements.txt"
+        if not requirements.is_file():
+            result["failed"] = True
+            result["failure_reason"] = f"No requirements.txt in {repo.name}"
+            return result
+
+        venv_path = repo.path / ".venv-build"
+        if venv_path.exists():
+            shutil.rmtree(venv_path)
+        build_dir = docs_dir / "_build"
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+
+        # Create venv. Use --without-pip-extras to skip unneeded ensurepip
+        # extras; the bootstrapping pip is enough to install requirements.
+        venv_proc = subprocess.run(
+            [python_executable, "-m", "venv", str(venv_path)],
+            capture_output=True,
+            text=True,
+        )
+        if venv_proc.returncode != 0:
+            result["failed"] = True
+            result["failure_reason"] = "venv creation failed"
+            result["install_stderr_tail"] = "\n".join(
+                venv_proc.stderr.splitlines()[-30:]
+            )
+            return result
+
+        pip_path = venv_path / "bin" / "pip"
+        py_path = venv_path / "bin" / "python"
+
+        install_proc = subprocess.run(
+            [str(pip_path), "install", "-q", "-r", str(requirements)],
+            capture_output=True,
+            text=True,
+        )
+        result["install_exit_code"] = install_proc.returncode
+        result["install_stderr_tail"] = "\n".join(
+            install_proc.stderr.splitlines()[-30:]
+        )
+        if install_proc.returncode != 0:
+            result["failed"] = True
+            result["failure_reason"] = "pip install failed"
+            return result
+
+        result["stage"] = "build"
+        build_proc = subprocess.run(
+            [
+                str(py_path),
+                "-m",
+                "sphinx",
+                "-b",
+                "dirhtml",
+                ".",
+                "_build/html",
+            ],
+            cwd=docs_dir,
+            capture_output=True,
+            text=True,
+        )
+        result["build_exit_code"] = build_proc.returncode
+        result["build_stderr_tail"] = "\n".join(
+            build_proc.stderr.splitlines()[-30:]
+        )
+        # Sphinx writes warnings to stderr in the form
+        # "/path/file.rst:N: WARNING: ..." - keep just those lines, and
+        # strip the absolute repo path so warnings produced from two
+        # different checkouts of the same code compare equal.
+        repo_prefix = str(repo.path.resolve()) + "/"
+        result["warnings"] = [
+            line.replace(repo_prefix, "")
+            for line in build_proc.stderr.splitlines()
+            if "WARNING:" in line or "ERROR:" in line
+        ]
+
+        if build_proc.returncode != 0:
+            result["failed"] = True
+            result["failure_reason"] = "sphinx build failed"
+            return result
+
+        html_dir = build_dir / "html"
+        if html_dir.is_dir():
+            result["pages"] = sorted(
+                str(p.relative_to(html_dir))
+                for p in html_dir.rglob("*.html")
+            )
+
+        result["stage"] = "complete"
+        return result
+
+    @staticmethod
+    def _normalise_html(content: str) -> str:
+        """Strip volatile patterns so two builds of the same code compare equal."""
+        for pattern, replacement in _HTML_NORMALISERS:
+            content = pattern.sub(replacement, content)
+        return content
+
+    @staticmethod
+    def _page_diff(
+        baseline_html: str,
+        candidate_html: str,
+        page_name: str,
+        max_lines: int = 80,
+    ) -> str | None:
+        """
+        Unified diff of two HTML pages after normalisation, or None if they
+        are identical post-normalisation. Diff is capped at ``max_lines``
+        with a ``... (N more)`` tail.
+        """
+        baseline_norm = RepoManager._normalise_html(baseline_html).splitlines()
+        candidate_norm = RepoManager._normalise_html(candidate_html).splitlines()
+        if baseline_norm == candidate_norm:
+            return None
+        diff_lines = list(
+            difflib.unified_diff(
+                baseline_norm,
+                candidate_norm,
+                fromfile=f"baseline/{page_name}",
+                tofile=f"candidate/{page_name}",
+                n=2,
+                lineterm="",
+            )
+        )
+        if len(diff_lines) > max_lines:
+            kept = diff_lines[:max_lines]
+            kept.append(f"... ({len(diff_lines) - max_lines} more diff lines)")
+            return "\n".join(kept)
+        return "\n".join(diff_lines)
+
+    def build_compare(
+        self,
+        candidate_repo: RepoCheckout,
+        baseline_ref: str = "main",
+        python_executable: str | None = None,
+    ) -> dict:
+        """
+        Build candidate and baseline, return a structured change report.
+
+        Builds the candidate in place (using its current working tree, then
+        clones a fresh copy of the same repo at ``baseline_ref`` into a
+        scratch directory and builds that as the baseline. The candidate's
+        working tree is never modified.
+
+        The result describes **what changed** between the two builds; it
+        does not adjudicate whether the change is good or bad. The operator
+        rolling out an estate-wide change is the one who can judge whether
+        each diff matches their intent.
+
+        Args:
+            candidate_repo: The checkout to test. Its working tree is built
+                as-is (uncommitted edits included).
+            baseline_ref: Git ref of the same repo to compare against
+                (default: ``main``).
+            python_executable: Python interpreter for venvs.
+
+        Returns:
+            Dict with:
+                baseline, candidate: per-side build results
+                baseline_ref, candidate_label
+                pages_added: pages in candidate not present in baseline
+                pages_removed: pages in baseline not present in candidate
+                pages_modified: {page_name: unified diff string} for pages
+                    on both sides whose content differs post-normalisation
+                warnings_added: warning lines new in candidate
+                warnings_removed: warning lines gone from candidate
+                baseline_scratch: where the baseline clone lives, for manual
+                    deeper inspection
+        """
+        print(f"Building candidate ({candidate_repo.name})...")
+        candidate_result = self.build_repo(candidate_repo, python_executable)
+
+        baseline_scratch = Path(
+            tempfile.mkdtemp(prefix=f"iati-baseline-{candidate_repo.name}-", dir="/tmp")
+        )
+        baseline_path = baseline_scratch / candidate_repo.name
+        clone_url = f"https://github.com/{GITHUB_ORG}/{candidate_repo.name}.git"
+        print(f"Cloning baseline ({baseline_ref})...")
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                baseline_ref,
+                clone_url,
+                str(baseline_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        baseline_repo = RepoCheckout(name=candidate_repo.name, path=baseline_path)
+        print(f"Building baseline ({baseline_ref})...")
+        baseline_result = self.build_repo(baseline_repo, python_executable)
+
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=candidate_repo.path,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            candidate_label = head if head and head != "HEAD" else "candidate"
+        except subprocess.CalledProcessError:
+            candidate_label = "candidate"
+
+        baseline_pages = set(baseline_result.get("pages", []))
+        candidate_pages = set(candidate_result.get("pages", []))
+        pages_added = sorted(candidate_pages - baseline_pages)
+        pages_removed = sorted(baseline_pages - candidate_pages)
+
+        baseline_html_dir = baseline_repo.path / "docs" / "_build" / "html"
+        candidate_html_dir = candidate_repo.path / "docs" / "_build" / "html"
+        pages_modified: dict[str, str] = {}
+        for page in sorted(baseline_pages & candidate_pages):
+            baseline_file = baseline_html_dir / page
+            candidate_file = candidate_html_dir / page
+            if not baseline_file.is_file() or not candidate_file.is_file():
+                continue
+            try:
+                baseline_html = baseline_file.read_text(errors="replace")
+                candidate_html = candidate_file.read_text(errors="replace")
+            except OSError:
+                continue
+            diff = self._page_diff(baseline_html, candidate_html, page)
+            if diff is not None:
+                pages_modified[page] = diff
+
+        baseline_warnings_set = set(baseline_result.get("warnings", []))
+        candidate_warnings_set = set(candidate_result.get("warnings", []))
+        warnings_added = [
+            w
+            for w in candidate_result.get("warnings", [])
+            if w not in baseline_warnings_set
+        ]
+        warnings_removed = [
+            w
+            for w in baseline_result.get("warnings", [])
+            if w not in candidate_warnings_set
+        ]
+
+        return {
+            "repo": candidate_repo.name,
+            "baseline_ref": baseline_ref,
+            "candidate_label": candidate_label,
+            "baseline": baseline_result,
+            "candidate": candidate_result,
+            "pages_added": pages_added,
+            "pages_removed": pages_removed,
+            "pages_modified": pages_modified,
+            "warnings_added": warnings_added,
+            "warnings_removed": warnings_removed,
+            "baseline_scratch": str(baseline_scratch),
+        }
+
+    # =========================================================================
     # CLEANUP
     # =========================================================================
 
@@ -882,6 +1202,164 @@ def print_run_script_results(results: dict, title: str) -> None:
                 print(f"    {line}")
         if not r.get("failed") and not stdout and not stderr and not changed:
             print("  (no output, no changes)")
+
+
+def print_build_result(result: dict) -> None:
+    """Print a single build_repo result in human-readable form."""
+    print(f"\n{'=' * 60}")
+    print(f" BUILD: {result['repo']}")
+    print("=" * 60)
+    if result["failed"]:
+        print(f"  FAILED at stage '{result['stage']}': {result['failure_reason']}")
+    else:
+        print("  OK")
+    if "install_exit_code" in result:
+        print(f"  install exit:    {result['install_exit_code']}")
+    if "build_exit_code" in result:
+        print(f"  sphinx exit:     {result['build_exit_code']}")
+    print(f"  warnings:        {len(result.get('warnings', []))}")
+    print(f"  pages produced:  {len(result.get('pages', []))}")
+    if result.get("warnings"):
+        print("  warning lines:")
+        for w in result["warnings"][:20]:
+            print(f"    {w}")
+        if len(result["warnings"]) > 20:
+            print(f"    ... ({len(result['warnings']) - 20} more)")
+    if result.get("install_stderr_tail") and result["failed"]:
+        print("  install stderr tail:")
+        for line in result["install_stderr_tail"].splitlines():
+            print(f"    {line}")
+    if result.get("build_stderr_tail") and result["failed"]:
+        print("  build stderr tail:")
+        for line in result["build_stderr_tail"].splitlines():
+            print(f"    {line}")
+
+
+def print_build_all_results(results: dict[str, dict]) -> None:
+    """One-line summary per repo for build-all."""
+    print(f"\n{'=' * 72}")
+    print(" BUILD-ALL SUMMARY")
+    print("=" * 72)
+    print(f"  {'repo':<40} {'status':<10} {'warns':>6} {'pages':>6}")
+    print(f"  {'-' * 40} {'-' * 10} {'-' * 6} {'-' * 6}")
+    for repo_name, r in results.items():
+        status = "FAIL" if r["failed"] else "OK"
+        warns = len(r.get("warnings", []))
+        pages = len(r.get("pages", []))
+        print(f"  {repo_name:<40} {status:<10} {warns:>6} {pages:>6}")
+    failures = [n for n, r in results.items() if r["failed"]]
+    if failures:
+        print(f"\n  {len(failures)} repo(s) failed: {', '.join(failures)}")
+        for name in failures:
+            r = results[name]
+            print(f"\n  --- {name} failure detail ---")
+            print(f"    stage: {r['stage']}")
+            print(f"    reason: {r.get('failure_reason', 'unknown')}")
+            tail = r.get("build_stderr_tail") or r.get("install_stderr_tail") or ""
+            for line in tail.splitlines()[-15:]:
+                print(f"    {line}")
+
+
+def print_build_compare(comparison: dict) -> None:
+    """
+    Print a build_compare change report.
+
+    The report describes what differs between baseline and candidate. It
+    doesn't categorise differences as good or bad - that judgement belongs
+    to the operator rolling out the change.
+    """
+    print(f"\n{'=' * 72}")
+    print(f" BUILD-COMPARE: {comparison['repo']}")
+    print(f"   baseline:  {comparison['baseline_ref']}")
+    print(f"   candidate: {comparison['candidate_label']}")
+    print("=" * 72)
+
+    baseline = comparison["baseline"]
+    candidate = comparison["candidate"]
+    print(
+        f"  baseline:  {'FAIL' if baseline['failed'] else 'OK':<5}  "
+        f"warns={len(baseline.get('warnings', []))}  "
+        f"pages={len(baseline.get('pages', []))}"
+    )
+    print(
+        f"  candidate: {'FAIL' if candidate['failed'] else 'OK':<5}  "
+        f"warns={len(candidate.get('warnings', []))}  "
+        f"pages={len(candidate.get('pages', []))}"
+    )
+
+    # If the candidate failed to build, surface that first - downstream
+    # sections may be empty or misleading. Don't suppress them; the
+    # operator may still want to see partial output.
+    if candidate["failed"] and not baseline["failed"]:
+        print(
+            f"\n  Candidate build did not complete (stage: {candidate['stage']})."
+        )
+        print(
+            f"  Reason: {candidate.get('failure_reason', 'unknown')}"
+        )
+        tail = candidate.get("build_stderr_tail") or candidate.get(
+            "install_stderr_tail"
+        )
+        if tail:
+            print("  stderr tail:")
+            for line in tail.splitlines()[-15:]:
+                print(f"    {line}")
+
+    pages_added = comparison["pages_added"]
+    pages_removed = comparison["pages_removed"]
+    pages_modified = comparison["pages_modified"]
+    warnings_added = comparison["warnings_added"]
+    warnings_removed = comparison["warnings_removed"]
+
+    if pages_added:
+        print(f"\n  Pages added ({len(pages_added)}):")
+        for p in pages_added[:30]:
+            print(f"    + {p}")
+        if len(pages_added) > 30:
+            print(f"    ... ({len(pages_added) - 30} more)")
+
+    if pages_removed:
+        print(f"\n  Pages removed ({len(pages_removed)}):")
+        for p in pages_removed[:30]:
+            print(f"    - {p}")
+        if len(pages_removed) > 30:
+            print(f"    ... ({len(pages_removed) - 30} more)")
+
+    if pages_modified:
+        print(f"\n  Pages modified ({len(pages_modified)}):")
+        for p in sorted(pages_modified):
+            line_count = pages_modified[p].count("\n") + 1
+            print(f"    ~ {p}  ({line_count} diff line(s))")
+        print()
+        for page in sorted(pages_modified):
+            print(f"  --- diff: {page} ---")
+            for line in pages_modified[page].splitlines():
+                print(f"    {line}")
+            print()
+
+    if warnings_added:
+        print(f"  Warnings added ({len(warnings_added)}):")
+        for w in warnings_added[:20]:
+            print(f"    + {w}")
+        if len(warnings_added) > 20:
+            print(f"    ... ({len(warnings_added) - 20} more)")
+        print()
+
+    if warnings_removed:
+        print(f"  Warnings removed ({len(warnings_removed)}):")
+        for w in warnings_removed[:20]:
+            print(f"    - {w}")
+        if len(warnings_removed) > 20:
+            print(f"    ... ({len(warnings_removed) - 20} more)")
+        print()
+
+    nothing_changed = not any(
+        [pages_added, pages_removed, pages_modified, warnings_added, warnings_removed]
+    )
+    if nothing_changed and not candidate["failed"]:
+        print("\n  No differences detected.")
+
+    print(f"\n  Baseline checkout (for further inspection): {comparison['baseline_scratch']}")
 
 
 def main():
@@ -1063,6 +1541,63 @@ def main():
         help="Body for the pull requests (default: auto-generated)",
     )
 
+    # Build command
+    build_parser = subparsers.add_parser(
+        "build",
+        help="Build one repo's docs in a fresh venv inside a fresh clone",
+        description="Clone the repo at its default branch, create a fresh venv,\n"
+        "install requirements.txt, and run sphinx-build. Reports the\n"
+        "build exit code, any Sphinx warnings, and the list of HTML\n"
+        "pages produced. The checkout is removed when done.\n\n"
+        "Use this to confirm the upstream main of a single repo builds\n"
+        "cleanly on your machine.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    build_parser.add_argument(
+        "repo",
+        help="Name of the repo to build (e.g. iati-publisher-docs)",
+    )
+
+    # Build-all command
+    build_all_parser = subparsers.add_parser(
+        "build-all",
+        help="Build every Documentation-tagged repo on main; report a health snapshot",
+        description="Clone every Documentation-tagged repo at its default branch,\n"
+        "build each in a fresh venv, and print a one-line summary per\n"
+        "repo (exit code, warning count, page count). Use this to take\n"
+        "a snapshot of estate-wide build health before/after a template\n"
+        "change.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # Build-compare command
+    build_compare_parser = subparsers.add_parser(
+        "build-compare",
+        help="Build a candidate checkout and a baseline ref; report what differs",
+        description="Build the candidate (a local checkout, including any uncommitted\n"
+        "edits) and a fresh clone of the same repo at --baseline-ref, then\n"
+        "report what differs between the two builds:\n"
+        "  * pages added / removed / modified (with per-page diffs)\n"
+        "  * Sphinx warnings added / removed\n\n"
+        "The report describes the change surface area. It does not adjudicate\n"
+        "whether each difference is intended or problematic - that's the\n"
+        "operator's call when rolling out an estate-wide change.\n\n"
+        "The candidate's working tree is never modified. Exit code is 1 only\n"
+        "when the candidate failed to build while the baseline succeeded;\n"
+        "otherwise 0, regardless of how much content changed.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    build_compare_parser.add_argument(
+        "--dir",
+        required=True,
+        help="Path to a local checkout to use as the candidate",
+    )
+    build_compare_parser.add_argument(
+        "--baseline-ref",
+        default="main",
+        help="Git ref of the upstream repo to compare against (default: main)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "list":
@@ -1097,6 +1632,83 @@ def main():
             f"--dir {manager.work_dir} -m 'Your commit message'"
         )
         return
+
+    if args.command == "build":
+        with RepoManager() as manager:
+            print(f"Working directory: {manager.work_dir}")
+            checkout = manager.checkout_repo(args.repo)
+            # checkout_repo creates a working branch; switch back to the
+            # default so we build the same code that's on main.
+            default = RepoManager._default_branch(checkout.path)
+            subprocess.run(
+                ["git", "checkout", default],
+                cwd=checkout.path,
+                check=True,
+                capture_output=True,
+            )
+            result = manager.build_repo(checkout)
+            print_build_result(result)
+            return 0 if not result["failed"] else 1
+
+    if args.command == "build-all":
+        with RepoManager() as manager:
+            print(f"Working directory: {manager.work_dir}")
+            print("Checking out repositories...")
+            manager.checkout_all(include_template=True)
+
+            # Build on each repo's default branch (not the working branch
+            # checkout_repo just created). We're measuring upstream state.
+            all_repos = [*manager.repos]
+            if manager.template:
+                all_repos.insert(0, manager.template)
+
+            results = {}
+            for repo in all_repos:
+                default = RepoManager._default_branch(repo.path)
+                subprocess.run(
+                    ["git", "checkout", default],
+                    cwd=repo.path,
+                    check=True,
+                    capture_output=True,
+                )
+                print(f"\nBuilding {repo.name}...")
+                results[repo.name] = manager.build_repo(repo)
+
+            print_build_all_results(results)
+            failures = [r for r in results.values() if r["failed"]]
+            return 1 if failures else 0
+
+    if args.command == "build-compare":
+        candidate_path = Path(args.dir).resolve()
+        if not candidate_path.is_dir() or not (candidate_path / ".git").is_dir():
+            parser.error(f"--dir {candidate_path} is not a git checkout")
+
+        # Infer the repo name from the origin remote so we know what to
+        # clone for the baseline. Falls back to the directory name.
+        try:
+            origin = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=candidate_path,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            # Match …/<repo>.git or …/<repo>
+            repo_name = origin.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+        except subprocess.CalledProcessError:
+            repo_name = candidate_path.name
+
+        candidate = RepoCheckout(name=repo_name, path=candidate_path)
+        manager = RepoManager()
+        comparison = manager.build_compare(candidate, baseline_ref=args.baseline_ref)
+        print_build_compare(comparison)
+        # Exit code is mechanical: only flag failure when the candidate
+        # itself failed to build while the baseline succeeded. Content
+        # differences are reported, not adjudicated - the operator judges
+        # whether each diff matches their intent.
+        candidate_failed = comparison["candidate"]["failed"]
+        baseline_failed = comparison["baseline"]["failed"]
+        return 1 if candidate_failed and not baseline_failed else 0
 
     if args.command == "make-prs":
         work_dir = Path(args.dir)
