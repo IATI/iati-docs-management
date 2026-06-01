@@ -1492,17 +1492,22 @@ def _age_str(iso_dt: str) -> str:
 
 
 def _pr_ci_status(rollup: list | None) -> str:
-    """Roll up a PR's statusCheckRollup into a single ``ok|fail|pending|none``."""
+    """Roll up a PR's statusCheckRollup into a single ``ok|fail|pending|none``.
+
+    statusCheckRollup mixes two shapes: ``CheckRun`` entries (GitHub
+    Actions) use ``conclusion``; ``StatusContext`` entries (external
+    statuses like Read the Docs) use ``state``. Either may be present.
+    """
     if not rollup:
         return "none"
-    bad = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE"}
+    bad = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "ERROR"}
     good = {"SUCCESS", "NEUTRAL", "SKIPPED"}
-    conclusions = [c.get("conclusion") for c in rollup]
-    if any(c in bad for c in conclusions):
+    outcomes = [c.get("conclusion") or c.get("state") for c in rollup]
+    if any(o in bad for o in outcomes):
         return "fail"
-    if any(not c for c in conclusions):
+    if any(not o for o in outcomes):
         return "pending"
-    if all(c in good for c in conclusions):
+    if all(o in good for o in outcomes):
         return "ok"
     return "mixed"
 
