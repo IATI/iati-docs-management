@@ -33,6 +33,9 @@ A Python 3.13 CLI for working across every Documentation-tagged repo, using ``ia
   # List every Documentation-tagged repo
   python scripts/repo_manager.py list
 
+  # Show branch protection state on each repo's default branch
+  python scripts/repo_manager.py check-protection
+
   # Show which repos diverge from the template, with diffs
   python scripts/repo_manager.py check
 

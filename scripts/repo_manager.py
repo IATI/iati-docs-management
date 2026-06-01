@@ -11,6 +11,7 @@ scripts in each repo.
 
 import datetime
 import difflib
+import json
 import os
 import re
 import shutil
@@ -126,6 +127,47 @@ class RepoManager:
         )
         repos = [r.strip() for r in result.stdout.strip().split("\n") if r.strip()]
         return repos
+
+    @staticmethod
+    def get_branch_protection(repo_name: str, branch: str = "main") -> dict | None:
+        """
+        Fetch branch protection settings for ``branch`` in ``repo_name``.
+
+        Returns the GitHub API response dict if the branch is protected,
+        or ``None`` if it isn't (HTTP 404 "Branch not protected").
+        """
+        proc = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{GITHUB_ORG}/{repo_name}/branches/{branch}/protection",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            if "Branch not protected" in proc.stderr or "Not Found" in proc.stderr:
+                return None
+            raise RuntimeError(
+                f"gh api failed for {repo_name}/{branch} protection: {proc.stderr.strip()}"
+            )
+        return json.loads(proc.stdout)
+
+    @staticmethod
+    def check_protection_all_repos(
+        repo_names: list[str] | None = None, branch: str = "main"
+    ) -> dict[str, dict | None]:
+        """
+        Fetch branch protection for ``branch`` on every tagged repo.
+
+        Returns a dict mapping repo name to the protection dict (or
+        ``None`` if the branch isn't protected).
+        """
+        if repo_names is None:
+            repo_names = RepoManager.get_tagged_repos()
+        return {
+            name: RepoManager.get_branch_protection(name, branch) for name in repo_names
+        }
 
     def checkout_repo(self, repo_name: str) -> RepoCheckout:
         """
@@ -1392,6 +1434,90 @@ def print_results(results: dict, title: str, show_diff: bool = True) -> None:
                     print(f"  {key}: {value}")
 
 
+def print_protection(protections: dict[str, dict | None], branch: str = "main") -> None:
+    """
+    Tabular dump of branch protection state per repo.
+
+    Structural columns (reviews, force_push, deletions, dismiss_stale,
+    enforce_admins, strict) come from a single canonical policy and
+    should match across the estate. The CHECKS column (count of required
+    status contexts) is inherently per-repo because each context name
+    embeds the repo's RTD slug, so we report it but don't compare it.
+    """
+    print(f"\n{'=' * 60}")
+    print(f" BRANCH PROTECTION ({branch})")
+    print("=" * 60)
+    print(
+        "\nStructural settings (reviews, force_push, etc) should match across"
+        "\nthe estate. CHECKS is the count of required status contexts and"
+        "\nvaries per repo (each name embeds the repo's RTD slug)."
+    )
+
+    rows = []
+    for repo_name in sorted(protections):
+        p = protections[repo_name]
+        if p is None:
+            rows.append(
+                {
+                    "repo": repo_name,
+                    "protected": "no",
+                    "reviews": "-",
+                    "checks": "-",
+                    "strict": "-",
+                    "dismiss_stale": "-",
+                    "enforce_admins": "-",
+                    "force_push": "-",
+                    "deletions": "-",
+                }
+            )
+            continue
+        pr_reviews = p.get("required_pull_request_reviews") or {}
+        rsc = p.get("required_status_checks") or {}
+        rows.append(
+            {
+                "repo": repo_name,
+                "protected": "yes",
+                "reviews": str(pr_reviews.get("required_approving_review_count", 0)),
+                "checks": str(len(rsc.get("contexts") or [])),
+                "strict": "yes" if rsc.get("strict") else "no",
+                "dismiss_stale": (
+                    "yes" if pr_reviews.get("dismiss_stale_reviews") else "no"
+                ),
+                "enforce_admins": (
+                    "yes" if (p.get("enforce_admins") or {}).get("enabled") else "no"
+                ),
+                "force_push": (
+                    "allowed"
+                    if (p.get("allow_force_pushes") or {}).get("enabled")
+                    else "forbidden"
+                ),
+                "deletions": (
+                    "allowed"
+                    if (p.get("allow_deletions") or {}).get("enabled")
+                    else "forbidden"
+                ),
+            }
+        )
+
+    cols = [
+        "repo",
+        "protected",
+        "reviews",
+        "checks",
+        "strict",
+        "dismiss_stale",
+        "enforce_admins",
+        "force_push",
+        "deletions",
+    ]
+    widths = {c: max(len(c.upper()), max(len(r[c]) for r in rows)) for c in cols}
+    header = "  ".join(c.upper().ljust(widths[c]) for c in cols)
+    print()
+    print(header)
+    for r in rows:
+        print("  ".join(r[c].ljust(widths[c]) for c in cols))
+
+
 def print_extra_paths(extras: dict[str, list[str]]) -> None:
     """
     Print top-level paths found in each repo that don't exist in the
@@ -1632,6 +1758,14 @@ def main():
 
     # List repos command
     subparsers.add_parser("list", help="List all tagged documentation repos")
+
+    subparsers.add_parser(
+        "check-protection",
+        help=(
+            "Show branch protection state for the default branch of every "
+            "Documentation-tagged repo. Read-only; never modifies protection."
+        ),
+    )
 
     # Check command
     check_parser = subparsers.add_parser("check", help="Check repos against template")
@@ -1878,6 +2012,11 @@ def main():
         for repo in repos:
             marker = " (template)" if repo == TEMPLATE_REPO else ""
             print(f"  - {repo}{marker}")
+        return
+
+    if args.command == "check-protection":
+        protections = RepoManager.check_protection_all_repos()
+        print_protection(protections)
         return
 
     if args.command == "checkout-all":
