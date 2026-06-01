@@ -18,6 +18,8 @@ Repository layout
 
 Many of the scripts rely on the `gh <https://cli.github.com/>`_ command-line tool; ensure it is installed and authenticated against the ``IATI`` org before running them.
 
+Repos are cloned via SSH (``git@github.com:IATI/...``), so the verbs that clone and push (``checkout-all``, ``make-prs``, ``build``, ``build-compare``) need a working SSH key registered with GitHub.
+
 Managing the documentation estate
 =================================
 

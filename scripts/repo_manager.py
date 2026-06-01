@@ -138,7 +138,7 @@ class RepoManager:
             RepoCheckout object for the cloned repo.
         """
         repo_path = self.work_dir / repo_name
-        clone_url = f"https://github.com/{GITHUB_ORG}/{repo_name}.git"
+        clone_url = f"git@github.com:{GITHUB_ORG}/{repo_name}.git"
 
         print(f"Cloning {repo_name}...")
         subprocess.run(
@@ -1132,7 +1132,7 @@ class RepoManager:
                 baseline_scratch: where the baseline clone lives, for manual
                     deeper inspection
         """
-        clone_url = f"https://github.com/{GITHUB_ORG}/{candidate_repo.name}.git"
+        clone_url = f"git@github.com:{GITHUB_ORG}/{candidate_repo.name}.git"
 
         # Validate the baseline ref before doing any build work. ``git clone
         # --depth 1 --branch`` only accepts branch and tag refs, not commit
