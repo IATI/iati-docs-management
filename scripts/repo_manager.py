@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -867,6 +868,7 @@ class RepoManager:
         pr_title: str | None = None,
         pr_body: str | None = None,
         dry_run: bool = True,
+        push_delay: float = 20.0,
     ) -> dict[str, dict]:
         """
         Commit changes and push the working branch in all repos, opening a
@@ -884,6 +886,11 @@ class RepoManager:
             pr_body: PR body. Defaults to a generated description.
             dry_run: If True, only report what would be done. Black is
                 skipped on dry runs since it would modify files.
+            push_delay: Seconds to wait between pushes, to spread
+                downstream webhook fan-out (e.g. ReadTheDocs build queue)
+                across time when publishing many PRs at once. Defaults
+                to 20s; pass 0 to disable. Skipped on dry runs and after
+                the final push.
 
         Returns:
             Dict mapping repo names to update results.
@@ -928,7 +935,8 @@ class RepoManager:
                         print(f"  {name}: {len(r['changed_files'])} file(s)")
 
         results = {}
-        for repo in self.repos:
+        last_idx = len(self.repos) - 1
+        for idx, repo in enumerate(self.repos):
             commit_result = self.commit_changes(repo, commit_message, dry_run)
             # Always attempt push; push_changes self-skips when there are no
             # commits ahead. This way pre-existing commits on the working
@@ -940,6 +948,15 @@ class RepoManager:
                 "commit": commit_result,
                 "push": push_result,
             }
+
+            if (
+                push_delay
+                and not dry_run
+                and idx < last_idx
+                and push_result.get("pushed")
+            ):
+                print(f"  sleeping {push_delay:g}s before next push...")
+                time.sleep(push_delay)
 
         return results
 
@@ -1956,6 +1973,15 @@ def main():
         "--pr-body",
         help="Body for the pull requests (default: auto-generated)",
     )
+    sync_parser.add_argument(
+        "--push-delay",
+        type=float,
+        default=20.0,
+        metavar="SECONDS",
+        help="Seconds to wait between pushes, to spread downstream webhook\n"
+        "fan-out (e.g. ReadTheDocs build queue) when publishing many PRs\n"
+        "at once. Default: 20. Pass 0 to disable.",
+    )
 
     # Run-script command
     run_script_parser = subparsers.add_parser(
@@ -2002,6 +2028,15 @@ def main():
     run_script_parser.add_argument(
         "--pr-body",
         help="Body for the pull requests (default: auto-generated)",
+    )
+    run_script_parser.add_argument(
+        "--push-delay",
+        type=float,
+        default=20.0,
+        metavar="SECONDS",
+        help="Seconds to wait between pushes, to spread downstream webhook\n"
+        "fan-out (e.g. ReadTheDocs build queue) when publishing many PRs\n"
+        "at once. Default: 20. Pass 0 to disable.",
     )
 
     # Checkout-all command
@@ -2061,6 +2096,15 @@ def main():
     make_prs_parser.add_argument(
         "--pr-body",
         help="Body for the pull requests (default: auto-generated)",
+    )
+    make_prs_parser.add_argument(
+        "--push-delay",
+        type=float,
+        default=20.0,
+        metavar="SECONDS",
+        help="Seconds to wait between pushes, to spread downstream webhook\n"
+        "fan-out (e.g. ReadTheDocs build queue) when publishing many PRs\n"
+        "at once. Default: 20. Pass 0 to disable.",
     )
 
     # Build command
@@ -2314,6 +2358,7 @@ def main():
             args.message,
             pr_body=args.pr_body,
             dry_run=False,
+            push_delay=args.push_delay,
         )
         print_results(push_results, "COMMIT + PUSH + PR")
         return
@@ -2357,6 +2402,7 @@ def main():
                 args.message,
                 pr_body=args.pr_body,
                 dry_run=False,
+                push_delay=args.push_delay,
             )
             print_results(push_results, "COMMIT + PUSH + PR")
 
@@ -2391,6 +2437,7 @@ def main():
                 args.message,
                 pr_body=args.pr_body,
                 dry_run=False,
+                push_delay=args.push_delay,
             )
             print_results(push_results, "COMMIT + PUSH + PR")
 
