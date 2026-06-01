@@ -169,6 +169,47 @@ class RepoManager:
             name: RepoManager.get_branch_protection(name, branch) for name in repo_names
         }
 
+    @staticmethod
+    def list_open_prs(repo_names: list[str] | None = None) -> list[dict]:
+        """
+        List all open PRs across every Documentation-tagged repo.
+
+        Returns one dict per PR with: ``repo``, ``number``, ``title``,
+        ``branch``, ``author``, ``createdAt``, ``updatedAt``,
+        ``mergeable``, ``reviewDecision``, ``statusCheckRollup``. PRs
+        from other authors and unrelated branches show up too - the
+        verb is meant to surface other in-flight work alongside our own.
+        """
+        if repo_names is None:
+            repo_names = RepoManager.get_tagged_repos()
+        fields = (
+            "number,title,headRefName,author,createdAt,updatedAt,"
+            "mergeable,reviewDecision,statusCheckRollup"
+        )
+        results = []
+        for repo_name in repo_names:
+            proc = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "list",
+                    "--repo",
+                    f"{GITHUB_ORG}/{repo_name}",
+                    "--state",
+                    "open",
+                    "--json",
+                    fields,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            for pr in json.loads(proc.stdout):
+                pr["repo"] = repo_name
+                pr["branch"] = pr.pop("headRefName")
+                results.append(pr)
+        return results
+
     def checkout_repo(self, repo_name: str) -> RepoCheckout:
         """
         Clone a single repository.
@@ -1434,6 +1475,98 @@ def print_results(results: dict, title: str, show_diff: bool = True) -> None:
                     print(f"  {key}: {value}")
 
 
+def _age_str(iso_dt: str) -> str:
+    """Compact human-readable duration since an ISO 8601 timestamp."""
+    dt = datetime.datetime.fromisoformat(iso_dt.replace("Z", "+00:00"))
+    delta = datetime.datetime.now(datetime.timezone.utc) - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    if seconds < 604800:
+        return f"{seconds // 86400}d"
+    return f"{seconds // 604800}w"
+
+
+def _pr_ci_status(rollup: list | None) -> str:
+    """Roll up a PR's statusCheckRollup into a single ``ok|fail|pending|none``.
+
+    statusCheckRollup mixes two shapes: ``CheckRun`` entries (GitHub
+    Actions) use ``conclusion``; ``StatusContext`` entries (external
+    statuses like Read the Docs) use ``state``. Either may be present.
+    """
+    if not rollup:
+        return "none"
+    bad = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "ERROR"}
+    good = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+    outcomes = [c.get("conclusion") or c.get("state") for c in rollup]
+    if any(o in bad for o in outcomes):
+        return "fail"
+    if any(not o for o in outcomes):
+        return "pending"
+    if all(o in good for o in outcomes):
+        return "ok"
+    return "mixed"
+
+
+_PR_MERGEABLE = {"MERGEABLE": "ok", "CONFLICTING": "conflict", "UNKNOWN": "unknown"}
+_PR_REVIEW = {
+    "APPROVED": "approved",
+    "CHANGES_REQUESTED": "changes",
+    "REVIEW_REQUIRED": "required",
+}
+
+
+def print_open_prs(prs: list[dict]) -> None:
+    """Tabular dump of open PRs across the estate."""
+    print(f"\n{'=' * 60}")
+    print(" OPEN PULL REQUESTS")
+    print("=" * 60)
+
+    if not prs:
+        print("\nNo open PRs across the estate.")
+        return
+
+    rows = []
+    for pr in sorted(prs, key=lambda p: (p["repo"], p["number"])):
+        rows.append(
+            {
+                "repo": pr["repo"],
+                "pr": f"#{pr['number']}",
+                "age": _age_str(pr["createdAt"]),
+                "upd": _age_str(pr["updatedAt"]),
+                "merge": _PR_MERGEABLE.get(pr.get("mergeable") or "", "?"),
+                "ci": _pr_ci_status(pr.get("statusCheckRollup")),
+                "review": _PR_REVIEW.get(pr.get("reviewDecision") or "", "n/a"),
+                "author": (pr.get("author") or {}).get("login", "?"),
+                "branch": pr["branch"],
+                "title": pr["title"],
+            }
+        )
+
+    cols = [
+        "repo",
+        "pr",
+        "age",
+        "upd",
+        "merge",
+        "ci",
+        "review",
+        "author",
+        "branch",
+        "title",
+    ]
+    widths = {c: max(len(c.upper()), max(len(r[c]) for r in rows)) for c in cols}
+    header = "  ".join(c.upper().ljust(widths[c]) for c in cols)
+    print()
+    print(header)
+    for r in rows:
+        print("  ".join(r[c].ljust(widths[c]) for c in cols))
+
+
 def print_protection(protections: dict[str, dict | None], branch: str = "main") -> None:
     """
     Tabular dump of branch protection state per repo.
@@ -1760,6 +1893,15 @@ def main():
     subparsers.add_parser("list", help="List all tagged documentation repos")
 
     subparsers.add_parser(
+        "list-prs",
+        help=(
+            "List open PRs across every Documentation-tagged repo, with "
+            "mergeability, CI rollup, and review status. Includes PRs from "
+            "anyone - useful for spotting in-flight work before stomping it."
+        ),
+    )
+
+    subparsers.add_parser(
         "check-protection",
         help=(
             "Show branch protection state for the default branch of every "
@@ -2012,6 +2154,11 @@ def main():
         for repo in repos:
             marker = " (template)" if repo == TEMPLATE_REPO else ""
             print(f"  - {repo}{marker}")
+        return
+
+    if args.command == "list-prs":
+        prs = RepoManager.list_open_prs()
+        print_open_prs(prs)
         return
 
     if args.command == "check-protection":
