@@ -2,15 +2,14 @@
 IATI Documentation Management
 *****************************
 
-GitHub
-------
+IATI has over a dozen documentation websites; this one is here to help with managing the rest. 
 
-All documentation websites should have the `Documentation` custom property set to `true`. 
 
 .. toctree::
-    :hidden:
     :titlesonly:
     :maxdepth: 3
     :caption: Documentation
+    :glob:
 
     Home <self>
+    *

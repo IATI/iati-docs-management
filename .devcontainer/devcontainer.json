@@ -15,7 +15,8 @@
 		// Configure properties specific to VS Code.
 		"vscode": {
 			"settings": {
-				"cSpell.language": "en-GB"
+				"cSpell.language": "en-GB",
+				"python.defaultInterpreterPath": "/usr/local/bin/python"
 			},
 			"extensions": [
 				"ms-azuretools.vscode-docker",
