@@ -36,11 +36,14 @@ _HTML_NORMALISERS: list[tuple[re.Pattern, str]] = [
 TEMPLATE_REPO = "iati-docs-base"
 GITHUB_ORG = "IATI"
 
-# Files that should be tracked across all repos. The pip-compile inputs
-# (.in) are the canonical sources; the generated requirements.txt files
-# are also tracked (see NOISY_DIFFS) so that template regenerations can
-# be propagated, but their diffs are not flagged because they drift
-# naturally as developers regenerate them locally.
+# Files that should be tracked across all repos. requirements.txt is the
+# file that actually controls the build (RTD and the build verb both
+# install from it), so it's treated as canonical and synced from the
+# template like everything else; the .in files are its pip-compile inputs.
+# An estate-wide dependency change means regenerating requirements.txt in
+# the template and syncing it out. A repo that legitimately needs extra
+# packages should carry a requirements_local.in overlay rather than
+# diverging silently.
 FILES_TO_CHECK = [
     ".readthedocs.yaml",
     "requirements.in",
@@ -49,12 +52,6 @@ FILES_TO_CHECK = [
     ".github/workflows/ci.yml",
     ".vscode/launch.json",
 ]
-
-# Files where a difference from the template is expected and not flagged
-# in check output. The diff itself is suppressed; the result is shown as
-# "DIFFERS (expected)" so the reader knows the file isn't identical but
-# we knowingly chose not to treat that as a problem.
-NOISY_DIFFS = {"requirements.txt"}
 
 
 @dataclass
@@ -1444,14 +1441,9 @@ def example_sync_gitignore(repo: RepoCheckout, manager: RepoManager) -> dict:
 
 def _file_result_status(r: dict) -> str:
     """Classify a per-file check or sync result for the operator."""
-    file_name = r.get("file", "")
     if r.get("matches"):
         return "OK"
-    if r.get("error"):
-        return "NEEDS ATTENTION"
-    if r.get("diff"):
-        if file_name in NOISY_DIFFS:
-            return "DIFFERS (expected)"
+    if r.get("error") or r.get("diff"):
         return "NEEDS ATTENTION"
     if r.get("action") == "skip":
         # Skip is only OK if the file already matches the template; a skip
@@ -1478,7 +1470,7 @@ def print_results(results: dict, title: str, show_diff: bool = True) -> None:
                     print(f"    Error: {r['error']}")
                 if r.get("action") and r["action"] != "skip":
                     print(f"    Action: {r['action']}")
-                if show_diff and r.get("diff") and file_name not in NOISY_DIFFS:
+                if show_diff and r.get("diff"):
                     print(f"\n    --- Diff for {file_name} ---")
                     # Indent each line of the diff for readability
                     for line in r["diff"].splitlines():
