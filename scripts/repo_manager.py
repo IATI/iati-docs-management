@@ -44,6 +44,11 @@ GITHUB_ORG = "IATI"
 # the template and syncing it out. A repo that legitimately needs extra
 # packages should carry a requirements_local.in overlay rather than
 # diverging silently.
+#
+# docs/conf.py is shared verbatim across the estate; all per-repo values live
+# in docs/project_info.py, which it imports. project_info.py is deliberately
+# NOT tracked here - it's the per-repo half and must never be overwritten from
+# the template.
 FILES_TO_CHECK = [
     ".readthedocs.yaml",
     "requirements.in",
@@ -51,6 +56,7 @@ FILES_TO_CHECK = [
     "requirements.txt",
     ".github/workflows/ci.yml",
     ".vscode/launch.json",
+    "docs/conf.py",
 ]
 
 
