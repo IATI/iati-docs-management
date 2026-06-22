@@ -1454,11 +1454,16 @@ def _file_result_status(r: dict) -> str:
     return "NEEDS ATTENTION"
 
 
+def _print_header(heading: str) -> None:
+    """Print a standard 60-char ruled section header."""
+    print(f"\n{'=' * 60}")
+    print(f" {heading}")
+    print("=" * 60)
+
+
 def print_results(results: dict, title: str, show_diff: bool = True) -> None:
     """Pretty print results."""
-    print(f"\n{'=' * 60}")
-    print(f" {title}")
-    print("=" * 60)
+    _print_header(title)
 
     for repo_name, repo_results in results.items():
         print(f"\n{repo_name}:")
@@ -1531,9 +1536,7 @@ _PR_REVIEW = {
 
 def print_open_prs(prs: list[dict]) -> None:
     """Tabular dump of open PRs across the estate."""
-    print(f"\n{'=' * 60}")
-    print(" OPEN PULL REQUESTS")
-    print("=" * 60)
+    _print_header("OPEN PULL REQUESTS")
 
     if not prs:
         print("\nNo open PRs across the estate.")
@@ -1586,9 +1589,7 @@ def print_protection(protections: dict[str, dict | None], branch: str = "main") 
     status contexts) is inherently per-repo because each context name
     embeds the repo's RTD slug, so we report it but don't compare it.
     """
-    print(f"\n{'=' * 60}")
-    print(f" BRANCH PROTECTION ({branch})")
-    print("=" * 60)
+    _print_header(f"BRANCH PROTECTION ({branch})")
     print(
         "\nStructural settings (reviews, force_push, etc) should match across"
         "\nthe estate. CHECKS is the count of required status contexts and"
@@ -1669,9 +1670,7 @@ def print_extra_paths(extras: dict[str, list[str]]) -> None:
     if not repos_with_extras:
         return
 
-    print(f"\n{'=' * 60}")
-    print(" EXTRA TOP-LEVEL PATHS (in repo, not in template)")
-    print("=" * 60)
+    _print_header("EXTRA TOP-LEVEL PATHS (in repo, not in template)")
     print(
         "\nReported for information only - the tooling never touches these."
         "\nThey may be deliberate per-repo additions (local linter config,"
@@ -1685,9 +1684,7 @@ def print_extra_paths(extras: dict[str, list[str]]) -> None:
 
 def print_run_script_results(results: dict, title: str) -> None:
     """Pretty print run-script results: repo, exit code, stdout, stderr."""
-    print(f"\n{'=' * 60}")
-    print(f" {title}")
-    print("=" * 60)
+    _print_header(title)
 
     for repo_name, r in results.items():
         print(f"\n{repo_name}:")
@@ -1718,9 +1715,7 @@ def print_run_script_results(results: dict, title: str) -> None:
 
 def print_build_result(result: dict) -> None:
     """Print a single build_repo result in human-readable form."""
-    print(f"\n{'=' * 60}")
-    print(f" BUILD: {result['repo']}")
-    print("=" * 60)
+    _print_header(f"BUILD: {result['repo']}")
     if result["failed"]:
         print(f"  FAILED at stage '{result['stage']}': {result['failure_reason']}")
     else:
