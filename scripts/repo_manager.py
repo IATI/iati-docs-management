@@ -36,11 +36,14 @@ _HTML_NORMALISERS: list[tuple[re.Pattern, str]] = [
 TEMPLATE_REPO = "iati-docs-base"
 GITHUB_ORG = "IATI"
 
-# Files that should be tracked across all repos. The pip-compile inputs
-# (.in) are the canonical sources; the generated requirements.txt files
-# are also tracked (see NOISY_DIFFS) so that template regenerations can
-# be propagated, but their diffs are not flagged because they drift
-# naturally as developers regenerate them locally.
+# Files that should be tracked across all repos. requirements.txt is the
+# file that actually controls the build (RTD and the build verb both
+# install from it), so it's treated as canonical and synced from the
+# template like everything else; the .in files are its pip-compile inputs.
+# An estate-wide dependency change means regenerating requirements.txt in
+# the template and syncing it out. A repo that legitimately needs extra
+# packages should carry a requirements_local.in overlay rather than
+# diverging silently.
 FILES_TO_CHECK = [
     ".readthedocs.yaml",
     "requirements.in",
@@ -49,12 +52,6 @@ FILES_TO_CHECK = [
     ".github/workflows/ci.yml",
     ".vscode/launch.json",
 ]
-
-# Files where a difference from the template is expected and not flagged
-# in check output. The diff itself is suppressed; the result is shown as
-# "DIFFERS (expected)" so the reader knows the file isn't identical but
-# we knowingly chose not to treat that as a problem.
-NOISY_DIFFS = {"requirements.txt"}
 
 
 @dataclass
@@ -1444,14 +1441,9 @@ def example_sync_gitignore(repo: RepoCheckout, manager: RepoManager) -> dict:
 
 def _file_result_status(r: dict) -> str:
     """Classify a per-file check or sync result for the operator."""
-    file_name = r.get("file", "")
     if r.get("matches"):
         return "OK"
-    if r.get("error"):
-        return "NEEDS ATTENTION"
-    if r.get("diff"):
-        if file_name in NOISY_DIFFS:
-            return "DIFFERS (expected)"
+    if r.get("error") or r.get("diff"):
         return "NEEDS ATTENTION"
     if r.get("action") == "skip":
         # Skip is only OK if the file already matches the template; a skip
@@ -1462,11 +1454,16 @@ def _file_result_status(r: dict) -> str:
     return "NEEDS ATTENTION"
 
 
+def _print_header(heading: str) -> None:
+    """Print a standard 60-char ruled section header."""
+    print(f"\n{'=' * 60}")
+    print(f" {heading}")
+    print("=" * 60)
+
+
 def print_results(results: dict, title: str, show_diff: bool = True) -> None:
     """Pretty print results."""
-    print(f"\n{'=' * 60}")
-    print(f" {title}")
-    print("=" * 60)
+    _print_header(title)
 
     for repo_name, repo_results in results.items():
         print(f"\n{repo_name}:")
@@ -1478,7 +1475,7 @@ def print_results(results: dict, title: str, show_diff: bool = True) -> None:
                     print(f"    Error: {r['error']}")
                 if r.get("action") and r["action"] != "skip":
                     print(f"    Action: {r['action']}")
-                if show_diff and r.get("diff") and file_name not in NOISY_DIFFS:
+                if show_diff and r.get("diff"):
                     print(f"\n    --- Diff for {file_name} ---")
                     # Indent each line of the diff for readability
                     for line in r["diff"].splitlines():
@@ -1539,9 +1536,7 @@ _PR_REVIEW = {
 
 def print_open_prs(prs: list[dict]) -> None:
     """Tabular dump of open PRs across the estate."""
-    print(f"\n{'=' * 60}")
-    print(" OPEN PULL REQUESTS")
-    print("=" * 60)
+    _print_header("OPEN PULL REQUESTS")
 
     if not prs:
         print("\nNo open PRs across the estate.")
@@ -1594,9 +1589,7 @@ def print_protection(protections: dict[str, dict | None], branch: str = "main") 
     status contexts) is inherently per-repo because each context name
     embeds the repo's RTD slug, so we report it but don't compare it.
     """
-    print(f"\n{'=' * 60}")
-    print(f" BRANCH PROTECTION ({branch})")
-    print("=" * 60)
+    _print_header(f"BRANCH PROTECTION ({branch})")
     print(
         "\nStructural settings (reviews, force_push, etc) should match across"
         "\nthe estate. CHECKS is the count of required status contexts and"
@@ -1677,9 +1670,7 @@ def print_extra_paths(extras: dict[str, list[str]]) -> None:
     if not repos_with_extras:
         return
 
-    print(f"\n{'=' * 60}")
-    print(" EXTRA TOP-LEVEL PATHS (in repo, not in template)")
-    print("=" * 60)
+    _print_header("EXTRA TOP-LEVEL PATHS (in repo, not in template)")
     print(
         "\nReported for information only - the tooling never touches these."
         "\nThey may be deliberate per-repo additions (local linter config,"
@@ -1693,9 +1684,7 @@ def print_extra_paths(extras: dict[str, list[str]]) -> None:
 
 def print_run_script_results(results: dict, title: str) -> None:
     """Pretty print run-script results: repo, exit code, stdout, stderr."""
-    print(f"\n{'=' * 60}")
-    print(f" {title}")
-    print("=" * 60)
+    _print_header(title)
 
     for repo_name, r in results.items():
         print(f"\n{repo_name}:")
@@ -1726,9 +1715,7 @@ def print_run_script_results(results: dict, title: str) -> None:
 
 def print_build_result(result: dict) -> None:
     """Print a single build_repo result in human-readable form."""
-    print(f"\n{'=' * 60}")
-    print(f" BUILD: {result['repo']}")
-    print("=" * 60)
+    _print_header(f"BUILD: {result['repo']}")
     if result["failed"]:
         print(f"  FAILED at stage '{result['stage']}': {result['failure_reason']}")
     else:
