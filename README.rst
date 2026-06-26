@@ -85,6 +85,7 @@ By default, ``check`` and ``sync`` operate on:
 * ``.github/workflows/ci.yml``
 * ``.vscode/launch.json``
 * ``.devcontainer/devcontainer.json``
+* ``docs/conf.py`` (shared verbatim; per-repo values live in ``docs/project_info.py``, which it imports and which is deliberately *not* synced)
 
 A difference from the template means something has changed and is reported as ``NEEDS ATTENTION`` with the diff. This applies to ``requirements.txt`` too: it's the file RTD and the ``build`` verb install from, so it's canonical in the template and synced out like everything else. An estate-wide dependency change (e.g. bumping Sphinx) means regenerating ``requirements.txt`` in the template and syncing it, not bumping the ``.in`` alone — nothing recompiles the ``.in`` at build time. A repo that genuinely needs extra packages should carry a ``requirements_local.in`` overlay rather than letting its lockfile diverge silently. Use ``--files`` on either command to override the default list.
 
