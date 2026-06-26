@@ -54,8 +54,10 @@ FILES_TO_CHECK = [
     "requirements.in",
     "requirements_dev.in",
     "requirements.txt",
+    "requirements_dev.txt",
     ".github/workflows/ci.yml",
     ".vscode/launch.json",
+    ".devcontainer/devcontainer.json",
     "docs/conf.py",
 ]
 
