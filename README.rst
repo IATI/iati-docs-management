@@ -82,6 +82,7 @@ By default, ``check`` and ``sync`` operate on:
 * ``.readthedocs.yaml``
 * ``requirements.in`` and ``requirements_dev.in`` (the canonical pip-compile inputs)
 * ``requirements.txt`` (the compiled lockfile the build actually installs from)
+* ``requirements_dev.txt`` (the compiled lockfile the CI lint job installs from)
 * ``.github/workflows/ci.yml``
 * ``.vscode/launch.json``
 * ``.devcontainer/devcontainer.json``
