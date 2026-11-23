@@ -187,11 +187,6 @@ Storage and cleanup
 
 Each invocation clones every tagged repo (plus the template) into a session directory under ``/tmp`` that is cleaned up when the command exits. Anything left behind is reaped by the OS's periodic ``/tmp`` cleanup.
 
-Python API
-~~~~~~~~~~
-
-For complex checks or syncs that don't fit the CLI, ``RepoManager`` exposes ``run_custom_check`` and ``run_custom_sync`` which accept a callable to run against each checkout. See ``example_check_python_version`` and ``example_sync_gitignore`` in ``scripts/repo_manager.py`` for the expected shape.
-
 Other scripts
 -------------
 

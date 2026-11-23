@@ -21,7 +21,6 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 # Patterns that vary between two builds of the same code and must be
 # normalised out before HTML pages are compared. Today the only known
@@ -146,9 +145,9 @@ class RepoManager:
         return repos
 
     @staticmethod
-    def get_branch_protection(repo_name: str, branch: str = "main") -> dict | None:
+    def get_branch_protection(repo_name: str) -> dict | None:
         """
-        Fetch branch protection settings for ``branch`` in ``repo_name``.
+        Fetch branch protection settings for ``main`` in ``repo_name``.
 
         Returns the GitHub API response dict if the branch is protected,
         or ``None`` if it isn't (HTTP 404 "Branch not protected").
@@ -157,7 +156,7 @@ class RepoManager:
             [
                 "gh",
                 "api",
-                f"repos/{GITHUB_ORG}/{repo_name}/branches/{branch}/protection",
+                f"repos/{GITHUB_ORG}/{repo_name}/branches/main/protection",
             ],
             capture_output=True,
             text=True,
@@ -166,28 +165,12 @@ class RepoManager:
             if "Branch not protected" in proc.stderr or "Not Found" in proc.stderr:
                 return None
             raise RuntimeError(
-                f"gh api failed for {repo_name}/{branch} protection: {proc.stderr.strip()}"
+                f"gh api failed for {repo_name}/main protection: {proc.stderr.strip()}"
             )
         return json.loads(proc.stdout)
 
     @staticmethod
-    def check_protection_all_repos(
-        repo_names: list[str] | None = None, branch: str = "main"
-    ) -> dict[str, dict | None]:
-        """
-        Fetch branch protection for ``branch`` on every tagged repo.
-
-        Returns a dict mapping repo name to the protection dict (or
-        ``None`` if the branch isn't protected).
-        """
-        if repo_names is None:
-            repo_names = RepoManager.get_tagged_repos()
-        return {
-            name: RepoManager.get_branch_protection(name, branch) for name in repo_names
-        }
-
-    @staticmethod
-    def list_open_prs(repo_names: list[str] | None = None) -> list[dict]:
+    def list_open_prs() -> list[dict]:
         """
         List all open PRs across every Documentation-tagged repo.
 
@@ -197,14 +180,12 @@ class RepoManager:
         from other authors and unrelated branches show up too - the
         verb is meant to surface other in-flight work alongside our own.
         """
-        if repo_names is None:
-            repo_names = RepoManager.get_tagged_repos()
         fields = (
             "number,title,headRefName,author,createdAt,updatedAt,"
             "mergeable,reviewDecision,statusCheckRollup"
         )
         results = []
-        for repo_name in repo_names:
+        for repo_name in RepoManager.get_tagged_repos():
             proc = subprocess.run(
                 [
                     "gh",
@@ -347,32 +328,6 @@ class RepoManager:
 
         return result
 
-    def check_all_repos(self, files: list[str] | None = None) -> dict[str, list[dict]]:
-        """
-        Check all repos against the template.
-
-        Args:
-            files: List of files to check. Defaults to FILES_TO_CHECK.
-
-        Returns:
-            Dict mapping repo names to list of check results.
-        """
-        if files is None:
-            files = FILES_TO_CHECK
-
-        if self.template is None:
-            raise ValueError("Template repo not checked out")
-
-        results = {}
-        for repo in self.repos:
-            repo_results = []
-            for file_path in files:
-                check_result = self.check_file_matches_template(repo, file_path)
-                repo_results.append(check_result)
-            results[repo.name] = repo_results
-
-        return results
-
     def extra_top_level_paths(self, repo: RepoCheckout) -> list[str]:
         """
         Top-level entries (files and directories) in the repo that don't
@@ -398,49 +353,17 @@ class RepoManager:
             extras.append(entry.name)
         return extras
 
-    def extra_paths_all_repos(self) -> dict[str, list[str]]:
-        """
-        Run ``extra_top_level_paths`` for every checked-out repo.
-        Returns a dict mapping repo name to its list of extras.
-        """
-        return {repo.name: self.extra_top_level_paths(repo) for repo in self.repos}
-
-    def run_custom_check(
-        self, check_func: Callable[[RepoCheckout, "RepoManager"], dict]
-    ) -> dict[str, dict]:
-        """
-        Run a caller-supplied check function against every repo.
-
-        Use this for checks that don't fit the file-by-file template
-        comparison - e.g. parsing config files, validating workflow
-        contents, or cross-referencing GitHub state.
-
-        Args:
-            check_func: Function taking ``(repo, manager)`` and returning a
-                dict describing the check outcome.
-
-        Returns:
-            Dict mapping repo names to the dict returned by ``check_func``.
-        """
-        results = {}
-        for repo in self.repos:
-            results[repo.name] = check_func(repo, self)
-        return results
-
     # =========================================================================
     # SYNC FUNCTIONS
     # =========================================================================
 
-    def sync_file_from_template(
-        self, repo: RepoCheckout, relative_path: str, dry_run: bool = True
-    ) -> dict:
+    def sync_file_from_template(self, repo: RepoCheckout, relative_path: str) -> dict:
         """
         Copy a file from the template to a repo.
 
         Args:
             repo: Target repo.
             relative_path: Path to the file relative to repo root.
-            dry_run: If True, only report what would be done.
 
         Returns:
             Dict with sync results.
@@ -455,7 +378,6 @@ class RepoManager:
             "repo": repo.name,
             "file": relative_path,
             "action": None,
-            "dry_run": dry_run,
         }
 
         if not template_file.exists():
@@ -474,62 +396,9 @@ class RepoManager:
                 return result
             result["action"] = "update"
 
-        if not dry_run:
-            repo_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(template_file, repo_file)
-            result["synced"] = True
-
+        repo_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(template_file, repo_file)
         return result
-
-    def sync_all_repos(
-        self, files: list[str] | None = None, dry_run: bool = True
-    ) -> dict[str, list[dict]]:
-        """
-        Sync specified files from template to all repos.
-
-        Args:
-            files: List of files to sync. Defaults to FILES_TO_CHECK.
-            dry_run: If True, only report what would be done.
-
-        Returns:
-            Dict mapping repo names to list of sync results.
-        """
-        if files is None:
-            files = FILES_TO_CHECK
-
-        results = {}
-        for repo in self.repos:
-            repo_results = []
-            for file_path in files:
-                sync_result = self.sync_file_from_template(repo, file_path, dry_run)
-                repo_results.append(sync_result)
-            results[repo.name] = repo_results
-
-        return results
-
-    def run_custom_sync(
-        self,
-        sync_func: Callable[[RepoCheckout, "RepoManager"], dict],
-    ) -> dict[str, dict]:
-        """
-        Run a caller-supplied sync function against every repo.
-
-        Use this for syncs that don't fit copying a file from the template -
-        e.g. editing a config in place, generating content, or updating
-        only a subset of a file. The ``sync_func`` is responsible for its
-        own dry-run logic; this method just dispatches.
-
-        Args:
-            sync_func: Function taking ``(repo, manager)`` and returning a
-                dict describing the sync outcome.
-
-        Returns:
-            Dict mapping repo names to the dict returned by ``sync_func``.
-        """
-        results = {}
-        for repo in self.repos:
-            results[repo.name] = sync_func(repo, self)
-        return results
 
     def run_script_on_all_repos(
         self,
@@ -669,16 +538,13 @@ class RepoManager:
                 "match the actual branch, or switch the checkout."
             )
 
-    def commit_changes(
-        self, repo: RepoCheckout, message: str, dry_run: bool = True
-    ) -> dict:
+    def commit_changes(self, repo: RepoCheckout, message: str) -> dict:
         """
         Commit any changes in a repo to the working branch.
 
         Args:
             repo: The repo to commit.
             message: Commit message.
-            dry_run: If True, only report what would be done.
 
         Returns:
             Dict with commit results.
@@ -689,7 +555,6 @@ class RepoManager:
             "repo": repo.name,
             "branch": self.branch_name,
             "action": None,
-            "dry_run": dry_run,
         }
 
         status = subprocess.run(
@@ -708,19 +573,16 @@ class RepoManager:
         result["action"] = "commit"
         result["changes"] = status.stdout.strip().split("\n")
 
-        if not dry_run:
-            subprocess.run(
-                ["git", "add", "-A"],
-                cwd=repo.path,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "commit", "-m", message],
-                cwd=repo.path,
-                check=True,
-            )
-            result["committed"] = True
-
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=repo.path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=repo.path,
+            check=True,
+        )
         return result
 
     def push_changes(
@@ -728,7 +590,6 @@ class RepoManager:
         repo: RepoCheckout,
         pr_title: str,
         pr_body: str,
-        dry_run: bool = True,
     ) -> dict:
         """
         Push the working branch to GitHub and open a pull request.
@@ -737,7 +598,6 @@ class RepoManager:
             repo: The repo to push.
             pr_title: Title for the pull request.
             pr_body: Body for the pull request.
-            dry_run: If True, only report what would be done.
 
         Returns:
             Dict with push results.
@@ -750,7 +610,6 @@ class RepoManager:
             "branch": self.branch_name,
             "base": default,
             "action": None,
-            "dry_run": dry_run,
         }
 
         # Count commits ahead of the default branch. Using rev-list avoids
@@ -773,34 +632,30 @@ class RepoManager:
         result["action"] = "push"
         result["commits_ahead"] = commits_ahead
 
-        if not dry_run:
-            subprocess.run(
-                ["git", "push", "-u", "origin", self.branch_name],
-                cwd=repo.path,
-                check=True,
-            )
-            pr_proc = subprocess.run(
-                [
-                    "gh",
-                    "pr",
-                    "create",
-                    "--title",
-                    pr_title,
-                    "--body",
-                    pr_body,
-                    "--base",
-                    default,
-                    "--head",
-                    self.branch_name,
-                ],
-                cwd=repo.path,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            result["pushed"] = True
-            result["pr_url"] = pr_proc.stdout.strip()
-
+        subprocess.run(
+            ["git", "push", "-u", "origin", self.branch_name],
+            cwd=repo.path,
+            check=True,
+        )
+        subprocess.run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--title",
+                pr_title,
+                "--body",
+                pr_body,
+                "--base",
+                default,
+                "--head",
+                self.branch_name,
+            ],
+            cwd=repo.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         return result
 
     @staticmethod
@@ -881,9 +736,7 @@ class RepoManager:
     def update_all_to_github(
         self,
         commit_message: str,
-        pr_title: str | None = None,
         pr_body: str | None = None,
-        dry_run: bool = True,
         push_delay: float = 20.0,
     ) -> dict[str, dict]:
         """
@@ -897,16 +750,12 @@ class RepoManager:
         CI's ``black --check``.
 
         Args:
-            commit_message: Message for commits.
-            pr_title: PR title. Defaults to the commit message.
+            commit_message: Message for commits, also used as the PR title.
             pr_body: PR body. Defaults to a generated description.
-            dry_run: If True, only report what would be done. Black is
-                skipped on dry runs since it would modify files.
             push_delay: Seconds to wait between pushes, to spread
                 downstream webhook fan-out (e.g. ReadTheDocs build queue)
                 across time when publishing many PRs at once. Defaults
-                to 20s; pass 0 to disable. Skipped on dry runs and after
-                the final push.
+                to 20s; pass 0 to disable. Skipped after the final push.
 
         Returns:
             Dict mapping repo names to update results.
@@ -915,8 +764,6 @@ class RepoManager:
             RuntimeError: If black fails (parse error or missing) in any
                 repo. No commits or pushes happen.
         """
-        if pr_title is None:
-            pr_title = commit_message
         if pr_body is None:
             pr_body = (
                 f"Automated update from iati-docs-management.\n\n"
@@ -927,50 +774,44 @@ class RepoManager:
         # Format every repo with black before any commit. Run all repos
         # before checking failures so the operator gets a complete picture
         # of what's wrong rather than the first failure only.
-        if not dry_run:
-            format_results = {
-                repo.name: self.format_with_black(repo) for repo in self.repos
-            }
-            failures = [r for r in format_results.values() if r["failed"]]
-            if failures:
-                for r in failures:
-                    print(f"\n  {r['repo']}: {r['failure_reason']}")
-                    for line in r.get("stderr_tail", "").splitlines():
-                        print(f"    {line}")
-                raise RuntimeError(
-                    f"black failed in {len(failures)} repo(s); aborting publish. "
-                    "No commits or PRs were created."
-                )
-            total_reformatted = sum(
-                len(r["changed_files"]) for r in format_results.values()
+        format_results = {
+            repo.name: self.format_with_black(repo) for repo in self.repos
+        }
+        failures = [r for r in format_results.values() if r["failed"]]
+        if failures:
+            for r in failures:
+                print(f"\n  {r['repo']}: {r['failure_reason']}")
+                for line in r.get("stderr_tail", "").splitlines():
+                    print(f"    {line}")
+            raise RuntimeError(
+                f"black failed in {len(failures)} repo(s); aborting publish. "
+                "No commits or PRs were created."
             )
-            if total_reformatted:
-                print(f"\nblack reformatted {total_reformatted} file(s):")
-                for name, r in format_results.items():
-                    if r["changed_files"]:
-                        print(f"  {name}: {len(r['changed_files'])} file(s)")
+        total_reformatted = sum(
+            len(r["changed_files"]) for r in format_results.values()
+        )
+        if total_reformatted:
+            print(f"\nblack reformatted {total_reformatted} file(s):")
+            for name, r in format_results.items():
+                if r["changed_files"]:
+                    print(f"  {name}: {len(r['changed_files'])} file(s)")
 
         results = {}
         last_idx = len(self.repos) - 1
         for idx, repo in enumerate(self.repos):
-            commit_result = self.commit_changes(repo, commit_message, dry_run)
+            commit_result = self.commit_changes(repo, commit_message)
             # Always attempt push; push_changes self-skips when there are no
             # commits ahead. This way pre-existing commits on the working
             # branch (e.g. from a manual commit before make-prs) still get
             # published.
-            push_result = self.push_changes(repo, pr_title, pr_body, dry_run=dry_run)
+            push_result = self.push_changes(repo, commit_message, pr_body)
 
             results[repo.name] = {
                 "commit": commit_result,
                 "push": push_result,
             }
 
-            if (
-                push_delay
-                and not dry_run
-                and idx < last_idx
-                and push_result.get("pushed")
-            ):
+            if push_delay and idx < last_idx and push_result["action"] == "push":
                 print(f"  sleeping {push_delay:g}s before next push...")
                 time.sleep(push_delay)
 
@@ -981,7 +822,7 @@ class RepoManager:
     # =========================================================================
 
     @staticmethod
-    def build_repo(repo: RepoCheckout, python_executable: str | None = None) -> dict:
+    def build_repo(repo: RepoCheckout) -> dict:
         """
         Build a repo's Sphinx docs in a fresh venv in an external scratch dir.
 
@@ -1001,11 +842,6 @@ class RepoManager:
         older than ~3 days, which is plenty of time to inspect a failed
         build manually.
 
-        Args:
-            repo: A checked-out repo.
-            python_executable: Python interpreter to bootstrap the venv from.
-                Defaults to the interpreter running this script.
-
         Returns:
             Dict with structured build results:
                 stage: "install" or "build" or "complete"
@@ -1020,9 +856,6 @@ class RepoManager:
                 html_dir: path to the directory containing the built HTML
                   (only set on a successful build)
         """
-        if python_executable is None:
-            python_executable = sys.executable
-
         result = {
             "repo": repo.name,
             "stage": "install",
@@ -1051,7 +884,7 @@ class RepoManager:
         html_dir = scratch_dir / "html"
 
         venv_proc = subprocess.run(
-            [python_executable, "-m", "venv", str(venv_path)],
+            [sys.executable, "-m", "venv", str(venv_path)],
             capture_output=True,
             text=True,
         )
@@ -1126,7 +959,7 @@ class RepoManager:
         result["stage"] = "complete"
         return result
 
-    def build_all_repos(self, include_template: bool = True) -> dict[str, dict]:
+    def build_all_repos(self) -> dict[str, dict]:
         """
         Build every checked-out repo at its default branch.
 
@@ -1140,16 +973,10 @@ class RepoManager:
         restored - the checkouts are intended to be thrown away after
         ``cleanup()``.
 
-        Args:
-            include_template: Whether to also build the template repo if
-                one is checked out. Defaults to True - an estate-wide
-                health snapshot normally wants to confirm the template
-                itself builds.
-
         Returns:
             Dict mapping repo names to ``build_repo`` result dicts. Order
-            puts the template (if included) first, then ``self.repos`` in
-            the order they were checked out.
+            puts the template (if checked out) first, then ``self.repos``
+            in the order they were checked out.
 
         Raises:
             ValueError: If no repos have been checked out yet.
@@ -1160,7 +987,7 @@ class RepoManager:
             )
 
         repos_to_build = list(self.repos)
-        if include_template and self.template is not None:
+        if self.template is not None:
             repos_to_build.insert(0, self.template)
 
         results: dict[str, dict] = {}
@@ -1213,7 +1040,6 @@ class RepoManager:
     def build_compare(
         candidate_repo: RepoCheckout,
         baseline_ref: str = "main",
-        python_executable: str | None = None,
     ) -> dict:
         """
         Build candidate and baseline, return a structured change report.
@@ -1233,7 +1059,6 @@ class RepoManager:
                 as-is (uncommitted edits included).
             baseline_ref: Git ref of the same repo to compare against
                 (default: ``main``).
-            python_executable: Python interpreter for venvs.
 
         Returns:
             Dict with:
@@ -1269,7 +1094,7 @@ class RepoManager:
             )
 
         print(f"Building candidate ({candidate_repo.name})...")
-        candidate_result = RepoManager.build_repo(candidate_repo, python_executable)
+        candidate_result = RepoManager.build_repo(candidate_repo)
 
         baseline_scratch = Path(
             tempfile.mkdtemp(prefix=f"iati-baseline-{candidate_repo.name}-", dir="/tmp")
@@ -1292,7 +1117,7 @@ class RepoManager:
         )
         baseline_repo = RepoCheckout(name=candidate_repo.name, path=baseline_path)
         print(f"Building baseline ({baseline_ref})...")
-        baseline_result = RepoManager.build_repo(baseline_repo, python_executable)
+        baseline_result = RepoManager.build_repo(baseline_repo)
 
         candidate_label = (
             RepoManager._current_branch(candidate_repo.path) or "candidate"
@@ -1402,10 +1227,10 @@ class RepoManager:
 # =============================================================================
 
 
-def sync_gitignore_entries(repo: RepoCheckout, manager: RepoManager) -> dict:
+def sync_gitignore_entries(repo: RepoCheckout) -> dict:
     """
-    Additive sync for ``run_custom_sync``: ensure a repo's ``.gitignore``
-    contains every entry in ``GITIGNORE_BASELINE``.
+    Additive sync: ensure a repo's ``.gitignore`` contains every entry in
+    ``GITIGNORE_BASELINE``.
 
     Unlike a template-file sync, this never replaces, removes, or reorders
     a repo's existing entries - it only appends the missing baseline ones.
@@ -1440,34 +1265,6 @@ def sync_gitignore_entries(repo: RepoCheckout, manager: RepoManager) -> dict:
         content += "\n"
     content += "\n".join(missing) + "\n"
     gitignore.write_text(content)
-
-    return result
-
-
-# =============================================================================
-# EXAMPLE CUSTOM CHECK/SYNC FUNCTIONS
-# =============================================================================
-
-
-def example_check_python_version(repo: RepoCheckout, manager: RepoManager) -> dict:
-    """
-    Example custom check for ``run_custom_check``: verify the Python version
-    pinned in ``.readthedocs.yaml``.
-    """
-    rtd_file = repo.path / ".readthedocs.yaml"
-    result = {"check": "python_version", "passed": False}
-
-    if not rtd_file.exists():
-        result["error"] = ".readthedocs.yaml not found"
-        return result
-
-    content = rtd_file.read_text()
-    # Simple check - in reality you'd parse the YAML
-    if 'python: "3.13"' in content:
-        result["passed"] = True
-        result["version"] = "3.13"
-    else:
-        result["error"] = "Python version is not 3.13"
 
     return result
 
@@ -1617,7 +1414,7 @@ def print_open_prs(prs: list[dict]) -> None:
         print("  ".join(r[c].ljust(widths[c]) for c in cols))
 
 
-def print_protection(protections: dict[str, dict | None], branch: str = "main") -> None:
+def print_protection(protections: dict[str, dict | None]) -> None:
     """
     Tabular dump of branch protection state per repo.
 
@@ -1627,7 +1424,7 @@ def print_protection(protections: dict[str, dict | None], branch: str = "main") 
     status contexts) is inherently per-repo because each context name
     embeds the repo's RTD slug, so we report it but don't compare it.
     """
-    _print_header(f"BRANCH PROTECTION ({branch})")
+    _print_header("BRANCH PROTECTION (main)")
     print(
         "\nStructural settings (reviews, force_push, etc) should match across"
         "\nthe estate. CHECKS is the count of required status contexts and"
@@ -1720,9 +1517,9 @@ def print_extra_paths(extras: dict[str, list[str]]) -> None:
             print(f"  - {p}")
 
 
-def print_run_script_results(results: dict, title: str) -> None:
+def print_run_script_results(results: dict) -> None:
     """Pretty print run-script results: repo, exit code, stdout, stderr."""
-    _print_header(title)
+    _print_header("RUN-SCRIPT RESULTS")
 
     for repo_name, r in results.items():
         print(f"\n{repo_name}:")
@@ -2268,7 +2065,10 @@ def main():
         return
 
     if args.command == "check-protection":
-        protections = RepoManager.check_protection_all_repos()
+        protections = {
+            name: RepoManager.get_branch_protection(name)
+            for name in RepoManager.get_tagged_repos()
+        }
         print_protection(protections)
         return
 
@@ -2314,7 +2114,7 @@ def main():
         with RepoManager() as manager:
             print(f"Working directory: {manager.work_dir}")
             print("Checking out repositories...")
-            manager.checkout_all(include_template=True)
+            manager.checkout_all()
             results = manager.build_all_repos()
             print_build_all_results(results)
             failures = [r for r in results.values() if r["failed"]]
@@ -2419,7 +2219,6 @@ def main():
         push_results = manager.update_all_to_github(
             args.message,
             pr_body=args.pr_body,
-            dry_run=False,
             push_delay=args.push_delay,
         )
         print_results(push_results, "COMMIT + PUSH + PR")
@@ -2442,10 +2241,18 @@ def main():
         print(f"Checked out {len(manager.repos)} repos (+ template)")
 
         if args.command == "check":
-            results = manager.check_all_repos(args.files)
+            results = {
+                repo.name: [
+                    manager.check_file_matches_template(repo, f) for f in args.files
+                ]
+                for repo in manager.repos
+            }
             print_results(results, "CHECK RESULTS", show_diff=not args.no_diff)
 
-            extras = manager.extra_paths_all_repos()
+            extras = {
+                repo.name: manager.extra_top_level_paths(repo)
+                for repo in manager.repos
+            }
             print_extra_paths(extras)
 
             # Summary
@@ -2459,30 +2266,30 @@ def main():
             print(f"\nSummary: {matching}/{total_files} files match template")
 
         elif args.command == "sync":
-            copy_results = manager.sync_all_repos(args.files, dry_run=False)
+            copy_results = {
+                repo.name: [
+                    manager.sync_file_from_template(repo, f) for f in args.files
+                ]
+                for repo in manager.repos
+            }
             print_results(copy_results, "FILE COPY")
 
             push_results = manager.update_all_to_github(
                 args.message,
                 pr_body=args.pr_body,
-                dry_run=False,
                 push_delay=args.push_delay,
             )
             print_results(push_results, "COMMIT + PUSH + PR")
 
         elif args.command == "sync-gitignore":
-            sync_results = manager.run_custom_sync(sync_gitignore_entries)
-            # run_custom_sync returns one result dict per repo; wrap each in a
-            # list so it renders through the same per-file path as `sync`.
-            print_results(
-                {repo: [r] for repo, r in sync_results.items()},
-                "GITIGNORE SYNC",
-            )
+            sync_results = {
+                repo.name: [sync_gitignore_entries(repo)] for repo in manager.repos
+            }
+            print_results(sync_results, "GITIGNORE SYNC")
 
             push_results = manager.update_all_to_github(
                 args.message,
                 pr_body=args.pr_body,
-                dry_run=False,
                 push_delay=args.push_delay,
             )
             print_results(push_results, "COMMIT + PUSH + PR")
@@ -2492,7 +2299,7 @@ def main():
                 args.script,
                 include_template=args.include_template,
             )
-            print_run_script_results(results, "RUN-SCRIPT RESULTS")
+            print_run_script_results(results)
 
             failed = next((r for r in results.values() if r.get("failed")), None)
             if failed:
@@ -2517,7 +2324,6 @@ def main():
             push_results = manager.update_all_to_github(
                 args.message,
                 pr_body=args.pr_body,
-                dry_run=False,
                 push_delay=args.push_delay,
             )
             print_results(push_results, "COMMIT + PUSH + PR")
