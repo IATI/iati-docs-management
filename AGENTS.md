@@ -108,10 +108,16 @@ TOP-LEVEL PATHS** section listing per-repo files and directories that
 exist in the repo but not the template. It's a hint, not a worklist;
 the tooling never touches those paths.
 
-### Three flavours of cross-repo change
+### Flavours of cross-repo change
 
 - **Template sync** (`sync`) — files identical across repos. PR per repo, all
   at once.
+- **Additive sync** (`sync-gitignore`) — a baseline set of entries guaranteed
+  present in a file whose other contents are the downstream's own. Appends
+  what's missing, never replaces or reorders. This is the "baseline, not
+  whitelist" principle made executable: `.gitignore` can't be synced verbatim
+  because downstream repos legitimately carry their own ignores. The baseline
+  lives in `GITIGNORE_BASELINE`.
 - **Scripted change** (`run-script`) — same modification, parameterised by
   repo. Script gets `cwd=<repo>` and `argv=[<repo-name>]`. Any non-zero exit
   aborts the whole run; no partial publishes.

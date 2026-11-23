@@ -87,6 +87,13 @@ By default, ``check`` and ``sync`` operate on:
 
 A difference from the template means something has changed and is reported as ``NEEDS ATTENTION`` with the diff. This applies to ``requirements.txt`` too: it's the file RTD and the ``build`` verb install from, so it's canonical in the template and synced out like everything else. An estate-wide dependency change (e.g. bumping Sphinx) means regenerating ``requirements.txt`` in the template and syncing it, not bumping the ``.in`` alone — nothing recompiles the ``.in`` at build time. A repo that genuinely needs extra packages should carry a ``requirements_local.in`` overlay rather than letting its lockfile diverge silently. Use ``--files`` on either command to override the default list.
 
+sync-gitignore
+~~~~~~~~~~~~~~
+
+Additively syncs a baseline set of ``.gitignore`` entries across the estate. For each repo it ensures every entry in ``GITIGNORE_BASELINE`` is present, appending any that are missing and leaving the repo's existing entries untouched, then commits on a fresh working branch (default ``iati-docs-management/gitignore-<timestamp>``), pushes, and opens a PR. Repos that already carry every baseline entry are skipped without producing a PR.
+
+Unlike ``sync``, ``.gitignore`` is *not* synced verbatim — downstream repos legitimately carry their own extra ignores, so a verbatim sync would either clobber them or flag them as permanent drift. Matching is line-based: a repo that ignores ``scripts/__pycache__/`` still gets the un-anchored ``__pycache__/`` appended, because the narrow entry doesn't cover ``docs/`` (where Sphinx compiles ``conf.py`` and ``project_info.py`` at build time). ``-m MSG`` is required; override the branch with ``--branch-name`` and the PR body with ``--pr-body``.
+
 run-script
 ~~~~~~~~~~
 

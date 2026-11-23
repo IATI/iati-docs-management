@@ -59,6 +59,19 @@ FILES_TO_CHECK = [
     "docs/conf.py",
 ]
 
+# Baseline .gitignore entries every estate repo should carry. Synced
+# additively by `sync-gitignore`: missing entries are appended, existing
+# entries are never replaced or reordered. .gitignore is deliberately NOT
+# in FILES_TO_CHECK - downstream repos legitimately carry their own extra
+# ignores, so it must not be synced verbatim. __pycache__/ is un-anchored
+# so it catches docs/ (Sphinx compiles conf.py and project_info.py there
+# at build time) as well as scripts/.
+GITIGNORE_BASELINE = [
+    "__pycache__/",
+    "*.pyc",
+    ".DS_Store",
+]
+
 
 @dataclass
 class RepoCheckout:
@@ -1385,6 +1398,53 @@ class RepoManager:
 
 
 # =============================================================================
+# CUSTOM SYNC FUNCTIONS
+# =============================================================================
+
+
+def sync_gitignore_entries(repo: RepoCheckout, manager: RepoManager) -> dict:
+    """
+    Additive sync for ``run_custom_sync``: ensure a repo's ``.gitignore``
+    contains every entry in ``GITIGNORE_BASELINE``.
+
+    Unlike a template-file sync, this never replaces, removes, or reorders
+    a repo's existing entries - it only appends the missing baseline ones.
+    Matching is line-based, not substring: a repo that already ignores
+    ``scripts/__pycache__/`` still gets the un-anchored ``__pycache__/``
+    appended, because the narrow entry doesn't cover ``docs/``.
+
+    Edits the working tree in place; the caller commits and PRs whatever
+    changed via ``update_all_to_github``.
+    """
+    gitignore = repo.path / ".gitignore"
+    result = {"repo": repo.name, "file": ".gitignore", "action": None}
+
+    if gitignore.exists():
+        content = gitignore.read_text()
+        existing = {line.strip() for line in content.splitlines()}
+    else:
+        content = ""
+        existing = set()
+
+    missing = [e for e in GITIGNORE_BASELINE if e not in existing]
+
+    if not missing:
+        result["action"] = "skip"
+        result["reason"] = "All baseline entries present"
+        return result
+
+    result["action"] = "create" if not gitignore.exists() else "update"
+    result["entries_added"] = missing
+
+    if content and not content.endswith("\n"):
+        content += "\n"
+    content += "\n".join(missing) + "\n"
+    gitignore.write_text(content)
+
+    return result
+
+
+# =============================================================================
 # EXAMPLE CUSTOM CHECK/SYNC FUNCTIONS
 # =============================================================================
 
@@ -1408,34 +1468,6 @@ def example_check_python_version(repo: RepoCheckout, manager: RepoManager) -> di
         result["version"] = "3.13"
     else:
         result["error"] = "Python version is not 3.13"
-
-    return result
-
-
-def example_sync_gitignore(repo: RepoCheckout, manager: RepoManager) -> dict:
-    """
-    Example custom sync for ``run_custom_sync``: ensure ``.gitignore``
-    contains a set of required entries.
-    """
-    gitignore = repo.path / ".gitignore"
-    required_entries = ["__pycache__/", "*.pyc", ".env"]
-
-    result = {"sync": "gitignore", "action": None}
-
-    if not gitignore.exists():
-        result["action"] = "create"
-        result["entries_to_add"] = required_entries
-        return result
-
-    content = gitignore.read_text()
-    missing = [e for e in required_entries if e not in content]
-
-    if not missing:
-        result["action"] = "skip"
-        result["reason"] = "All required entries present"
-    else:
-        result["action"] = "update"
-        result["entries_to_add"] = missing
 
     return result
 
@@ -1976,6 +2008,43 @@ def main():
         "at once. Default: 20. Pass 0 to disable.",
     )
 
+    # Sync-gitignore command
+    sync_gitignore_parser = subparsers.add_parser(
+        "sync-gitignore",
+        help="Additively sync baseline .gitignore entries and open PRs",
+        description="For each Documentation-tagged repo: ensure .gitignore carries the\n"
+        "baseline entries (GITIGNORE_BASELINE), appending any that are missing\n"
+        "without touching the repo's existing entries, then commit, push, and\n"
+        "open a PR. Repos that already have every baseline entry are skipped\n"
+        "without producing a PR.\n\n"
+        ".gitignore is synced additively rather than verbatim because\n"
+        "downstream repos legitimately carry their own extra ignores.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sync_gitignore_parser.add_argument(
+        "--message",
+        "-m",
+        required=True,
+        help="Commit message (also used as PR title unless --pr-body overrides)",
+    )
+    sync_gitignore_parser.add_argument(
+        "--branch-name",
+        help="Override the auto-generated working branch name",
+    )
+    sync_gitignore_parser.add_argument(
+        "--pr-body",
+        help="Body for the pull requests (default: auto-generated)",
+    )
+    sync_gitignore_parser.add_argument(
+        "--push-delay",
+        type=float,
+        default=20.0,
+        metavar="SECONDS",
+        help="Seconds to wait between pushes, to spread downstream webhook\n"
+        "fan-out (e.g. ReadTheDocs build queue) when publishing many PRs\n"
+        "at once. Default: 20. Pass 0 to disable.",
+    )
+
     # Run-script command
     run_script_parser = subparsers.add_parser(
         "run-script",
@@ -2362,6 +2431,8 @@ def main():
     if branch_name is None and args.command == "run-script":
         script_stem = Path(args.script).stem
         branch_name = RepoManager.generate_branch_name(prefix=f"script-{script_stem}")
+    if branch_name is None and args.command == "sync-gitignore":
+        branch_name = RepoManager.generate_branch_name(prefix="gitignore")
 
     with RepoManager(branch_name=branch_name) as manager:
         print(f"Working directory: {manager.work_dir}")
@@ -2390,6 +2461,23 @@ def main():
         elif args.command == "sync":
             copy_results = manager.sync_all_repos(args.files, dry_run=False)
             print_results(copy_results, "FILE COPY")
+
+            push_results = manager.update_all_to_github(
+                args.message,
+                pr_body=args.pr_body,
+                dry_run=False,
+                push_delay=args.push_delay,
+            )
+            print_results(push_results, "COMMIT + PUSH + PR")
+
+        elif args.command == "sync-gitignore":
+            sync_results = manager.run_custom_sync(sync_gitignore_entries)
+            # run_custom_sync returns one result dict per repo; wrap each in a
+            # list so it renders through the same per-file path as `sync`.
+            print_results(
+                {repo: [r] for repo, r in sync_results.items()},
+                "GITIGNORE SYNC",
+            )
 
             push_results = manager.update_all_to_github(
                 args.message,
