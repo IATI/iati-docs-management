@@ -19,7 +19,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 # Patterns that vary between two builds of the same code and must be
@@ -90,6 +91,10 @@ def clone_url(repo_name: str) -> str:
     return f"git@github.com:{GITHUB_ORG}/{repo_name}.git"
 
 
+def _tail(text: str, lines: int) -> str:
+    return "\n".join(text.splitlines()[-lines:])
+
+
 @dataclass
 class RepoCheckout:
     """Represents a checked-out repository."""
@@ -97,6 +102,81 @@ class RepoCheckout:
     name: str
     path: Path
     is_template: bool = False
+
+
+class FileState(Enum):
+    MATCH = "match"
+    DIFFERS = "differs"
+    MISSING_IN_REPO = "missing in repo"
+    MISSING_IN_TEMPLATE = "missing in template"
+
+
+@dataclass
+class FileCheck:
+    """How one tracked file in a repo compares with the template's copy."""
+
+    path: str
+    state: FileState
+    diff: str = ""
+
+
+# In the result classes below, an empty ``failure`` means success.
+
+
+@dataclass
+class ScriptResult:
+    repo: str
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    changed_files: list[str] = field(default_factory=list)
+    failure: str = ""
+
+
+@dataclass
+class BlackResult:
+    reformatted: list[str] = field(default_factory=list)
+    failure: str = ""
+    stderr_tail: str = ""
+
+
+@dataclass
+class PublishResult:
+    committed: bool
+    pushed: bool
+
+
+@dataclass
+class BuildResult:
+    repo: str
+    stage: str = "install"
+    failure: str = ""
+    install_exit_code: int | None = None
+    install_stderr_tail: str = ""
+    build_exit_code: int | None = None
+    build_stderr_tail: str = ""
+    warnings: list[str] = field(default_factory=list)
+    pages: list[str] = field(default_factory=list)
+    html_dir: Path | None = None
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.failure)
+
+
+@dataclass
+class BuildComparison:
+    repo: str
+    baseline_ref: str
+    candidate_label: str
+    baseline: BuildResult
+    candidate: BuildResult
+    pages_added: list[str]
+    pages_removed: list[str]
+    pages_modified: dict[str, str]
+    warnings_added: list[str]
+    warnings_removed: list[str]
+    baseline_scratch: Path
 
 
 class RepoManager:
@@ -266,57 +346,39 @@ class RepoManager:
     # CHECK FUNCTIONS
     # =========================================================================
 
-    def check_file_matches_template(
-        self, repo: RepoCheckout, relative_path: str
-    ) -> dict:
-        """
-        Check if a file in a repo matches the template.
-
-        Args:
-            repo: The repo to check.
-            relative_path: Path to the file relative to repo root.
-
-        Returns:
-            Dict with check results.
-        """
+    def _file_state(self, repo: RepoCheckout, relative_path: str) -> FileState:
         if self.template is None:
             raise ValueError("Template repo not checked out")
 
         template_file = self.template.path / relative_path
         repo_file = repo.path / relative_path
-
-        result = {
-            "repo": repo.name,
-            "file": relative_path,
-            "template_exists": template_file.exists(),
-            "repo_exists": repo_file.exists(),
-            "matches": False,
-            "diff": None,
-        }
-
         if not template_file.exists():
-            result["error"] = "Template file does not exist"
-            return result
-
+            return FileState.MISSING_IN_TEMPLATE
         if not repo_file.exists():
-            result["error"] = "File missing from repo"
-            return result
+            return FileState.MISSING_IN_REPO
+        if template_file.read_text() == repo_file.read_text():
+            return FileState.MATCH
+        return FileState.DIFFERS
 
-        template_content = template_file.read_text()
-        repo_content = repo_file.read_text()
-
-        if template_content == repo_content:
-            result["matches"] = True
-        else:
-            # Get diff showing what would change in the repo (repo -> template)
-            diff_result = subprocess.run(
-                ["diff", "-u", str(repo_file), str(template_file)],
+    def check_file_matches_template(
+        self, repo: RepoCheckout, relative_path: str
+    ) -> FileCheck:
+        """Compare a repo's file with the template's, with a diff if they differ."""
+        state = self._file_state(repo, relative_path)
+        diff = ""
+        if state is FileState.DIFFERS:
+            # repo -> template, i.e. what a sync would change in the repo
+            diff = subprocess.run(
+                [
+                    "diff",
+                    "-u",
+                    str(repo.path / relative_path),
+                    str(self.template.path / relative_path),
+                ],
                 capture_output=True,
                 text=True,
-            )
-            result["diff"] = diff_result.stdout
-
-        return result
+            ).stdout
+        return FileCheck(relative_path, state, diff)
 
     def extra_top_level_paths(self, repo: RepoCheckout) -> list[str]:
         """
@@ -347,92 +409,40 @@ class RepoManager:
     # SYNC FUNCTIONS
     # =========================================================================
 
-    def sync_file_from_template(self, repo: RepoCheckout, relative_path: str) -> dict:
-        """
-        Copy a file from the template to a repo.
-
-        Args:
-            repo: Target repo.
-            relative_path: Path to the file relative to repo root.
-
-        Returns:
-            Dict with sync results.
-        """
-        if self.template is None:
-            raise ValueError("Template repo not checked out")
-
-        template_file = self.template.path / relative_path
-        repo_file = repo.path / relative_path
-
-        result = {
-            "repo": repo.name,
-            "file": relative_path,
-            "action": None,
-        }
-
-        if not template_file.exists():
-            result["action"] = "skip"
-            result["reason"] = "Template file does not exist"
-            return result
-
-        if not repo_file.exists():
-            result["action"] = "create"
-        else:
-            template_content = template_file.read_text()
-            repo_content = repo_file.read_text()
-            if template_content == repo_content:
-                result["action"] = "skip"
-                result["reason"] = "Already matches template"
-                return result
-            result["action"] = "update"
-
-        repo_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(template_file, repo_file)
-        return result
+    def sync_file_from_template(
+        self, repo: RepoCheckout, relative_path: str
+    ) -> FileCheck:
+        """Copy a file from the template into a repo; reports its state beforehand."""
+        state = self._file_state(repo, relative_path)
+        if state in (FileState.DIFFERS, FileState.MISSING_IN_REPO):
+            repo_file = repo.path / relative_path
+            repo_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.template.path / relative_path, repo_file)
+        return FileCheck(relative_path, state)
 
     def run_script_on_all_repos(
         self,
         script_path: str | Path,
         include_template: bool = False,
-    ) -> dict[str, dict]:
+    ) -> dict[str, ScriptResult]:
         """
-        Run a script in each repo, aborting on first failure.
+        Run ``<script> <repo-name>`` with cwd set to each checkout.
 
-        The script is invoked as ``<script> <repo-name>`` with the working
-        directory set to the repo's checkout. stdout, stderr, exit code,
-        and the list of changed files (per ``git status --porcelain``) are
-        captured and returned.
-
-        Processing stops as soon as any repo fails - either a non-zero
-        exit, a timeout, or an exception invoking the script. The failing
-        repo's result will have ``failed=True`` and a ``failure_reason``
-        string. Callers should treat any failure as a signal to abort the
-        whole estate-wide operation rather than publish a partial run.
-
-        This method does not commit or push anything - it only runs the
-        script and reports. Callers decide what to do with the results.
-
-        Args:
-            script_path: Path to the script. Must be executable.
-            include_template: If True, also run on the template repo.
-
-        Returns:
-            Dict mapping repo names to {exit, stdout, stderr, changed_files}
-            or, on failure, with additional {failed, failure_reason}.
+        Stops at the first failure: a non-zero exit, a timeout, or the script
+        not starting. Nothing is committed or pushed.
         """
         script_path = Path(script_path).resolve()
 
         if not script_path.exists():
             raise FileNotFoundError(f"Script not found: {script_path}")
 
-        results = {}
         repos_to_process = list(self.repos)
         if include_template and self.template:
             repos_to_process.append(self.template)
 
+        results = {}
         for repo in repos_to_process:
-            result = {"repo": repo.name, "script": str(script_path)}
-
+            result = results[repo.name] = ScriptResult(repo.name)
             try:
                 proc = subprocess.run(
                     [str(script_path), repo.name],
@@ -441,29 +451,20 @@ class RepoManager:
                     text=True,
                     timeout=300,
                 )
-                result["exit"] = proc.returncode
-                result["stdout"] = proc.stdout
-                result["stderr"] = proc.stderr
-
-                result["changed_files"] = git(
+                result.exit_code = proc.returncode
+                result.stdout = proc.stdout
+                result.stderr = proc.stderr
+                result.changed_files = git(
                     "status", "--porcelain", cwd=repo.path
                 ).splitlines()
-
                 if proc.returncode != 0:
-                    result["failed"] = True
-                    result["failure_reason"] = (
-                        f"Script exited with code {proc.returncode}"
-                    )
+                    result.failure = f"Script exited with code {proc.returncode}"
             except subprocess.TimeoutExpired:
-                result["failed"] = True
-                result["failure_reason"] = "Timed out after 300 seconds"
-            except Exception as e:
-                result["failed"] = True
-                result["failure_reason"] = str(e)
+                result.failure = "Timed out after 300 seconds"
+            except (OSError, subprocess.CalledProcessError) as exc:
+                result.failure = str(exc)
 
-            results[repo.name] = result
-
-            if result.get("failed"):
+            if result.failure:
                 break
 
         return results
@@ -506,81 +507,27 @@ class RepoManager:
                 "match the actual branch, or switch the checkout."
             )
 
-    def commit_changes(self, repo: RepoCheckout, message: str) -> dict:
-        """
-        Commit any changes in a repo to the working branch.
-
-        Args:
-            repo: The repo to commit.
-            message: Commit message.
-
-        Returns:
-            Dict with commit results.
-        """
+    def commit_changes(self, repo: RepoCheckout, message: str) -> bool:
+        """Commit the whole working tree; False if there was nothing to commit."""
         self._ensure_safe_branch(repo)
 
-        result = {
-            "repo": repo.name,
-            "branch": self.branch_name,
-            "action": None,
-        }
-
-        changes = git("status", "--porcelain", cwd=repo.path)
-
-        if not changes:
-            result["action"] = "skip"
-            result["reason"] = "No changes to commit"
-            return result
-
-        result["action"] = "commit"
-        result["changes"] = changes.split("\n")
+        if not git("status", "--porcelain", cwd=repo.path):
+            return False
 
         # Uncaptured so git's own output reaches the operator.
         subprocess.run(["git", "add", "-A"], cwd=repo.path, check=True)
         subprocess.run(["git", "commit", "-m", message], cwd=repo.path, check=True)
-        return result
+        return True
 
-    def push_changes(
-        self,
-        repo: RepoCheckout,
-        pr_title: str,
-        pr_body: str,
-    ) -> dict:
-        """
-        Push the working branch to GitHub and open a pull request.
-
-        Args:
-            repo: The repo to push.
-            pr_title: Title for the pull request.
-            pr_body: Body for the pull request.
-
-        Returns:
-            Dict with push results.
-        """
+    def push_changes(self, repo: RepoCheckout, pr_title: str, pr_body: str) -> bool:
+        """Push the working branch and open a PR; False if it has nothing to publish."""
         self._ensure_safe_branch(repo)
 
         default = self.default_branch(repo.path)
-        result = {
-            "repo": repo.name,
-            "branch": self.branch_name,
-            "base": default,
-            "action": None,
-        }
-
-        # Count commits ahead of the default branch. Using rev-list avoids
-        # parsing git's English porcelain output and works correctly even
-        # if upstream tracking isn't yet configured for the new branch.
-        commits_ahead = int(
-            git("rev-list", "--count", f"origin/{default}..HEAD", cwd=repo.path)
-        )
-
-        if commits_ahead == 0:
-            result["action"] = "skip"
-            result["reason"] = f"No commits ahead of origin/{default}"
-            return result
-
-        result["action"] = "push"
-        result["commits_ahead"] = commits_ahead
+        # rev-list works before upstream tracking exists for the new branch.
+        ahead = git("rev-list", "--count", f"origin/{default}..HEAD", cwd=repo.path)
+        if int(ahead) == 0:
+            return False
 
         # Uncaptured so git's own output reaches the operator.
         subprocess.run(
@@ -601,40 +548,16 @@ class RepoManager:
             self.branch_name,
             cwd=repo.path,
         )
-        return result
+        return True
 
     @staticmethod
-    def format_with_black(repo: RepoCheckout) -> dict:
+    def format_with_black(repo: RepoCheckout) -> BlackResult:
         """
-        Run black across a repo's tree, auto-fixing formatting.
+        Reformat a repo's tree with black, leaving the changes for the next commit.
 
-        Reformatting changes are left in the working tree for a subsequent
-        commit to pick up - same as if a contributor had run black before
-        committing. Black's version is whichever one is installed for the
-        Python running this script; that matches CI because every repo's
-        ``requirements_dev.in`` pins the same black via template sync.
-
-        Black exits non-zero only when it can't parse the source (i.e. a
-        real syntax error). That's the one case where the caller should
-        abort the publish rather than continue: silently auto-fixing
-        formatting is fine, silently dropping unparseable code on the
-        floor is not.
-
-        Args:
-            repo: The repo to format.
-
-        Returns:
-            Dict with:
-                exit_code: black's exit code (0 = clean or reformatted OK)
-                failed: True if black couldn't run or couldn't parse the
-                  source
-                failure_reason: human-readable explanation if failed
-                changed_files: list of file paths black reformatted
-                  (from black's stderr; relative to wherever black logged)
-                stderr_tail: last ~20 lines of black stderr
+        Uses the black installed for this interpreter, which matches each repo's
+        CI because ``requirements_dev.in`` is synced from the template.
         """
-        result: dict = {"repo": repo.name, "failed": False, "changed_files": []}
-
         try:
             proc = subprocess.run(
                 [sys.executable, "-m", "black", str(repo.path)],
@@ -642,72 +565,50 @@ class RepoManager:
                 text=True,
             )
         except FileNotFoundError:
-            result["failed"] = True
-            result["failure_reason"] = (
-                f"Python interpreter not found at {sys.executable!r}."
+            return BlackResult(
+                failure=f"Python interpreter not found at {sys.executable!r}."
             )
-            return result
 
-        result["exit_code"] = proc.returncode
-        result["stderr_tail"] = "\n".join(proc.stderr.splitlines()[-20:])
-
-        # Detect missing black before treating the non-zero as a parse error.
+        stderr_tail = _tail(proc.stderr, 20)
         if "No module named" in proc.stderr and "black" in proc.stderr:
-            result["failed"] = True
-            result["failure_reason"] = (
-                f"black is not installed for {sys.executable}. "
-                "Install this repo's requirements_dev.txt and try again."
+            return BlackResult(
+                failure=(
+                    f"black is not installed for {sys.executable}. "
+                    "Install this repo's requirements_dev.txt and try again."
+                ),
+                stderr_tail=stderr_tail,
             )
-            return result
-
         if proc.returncode != 0:
-            result["failed"] = True
-            result["failure_reason"] = (
-                f"black exited {proc.returncode} - usually a syntax error "
-                "in the source. See stderr_tail."
+            return BlackResult(
+                failure=(
+                    f"black exited {proc.returncode} - usually a syntax error "
+                    "in the source. See stderr_tail."
+                ),
+                stderr_tail=stderr_tail,
             )
-            return result
 
-        # Lines on stderr like "reformatted /path/to/file.py" tell us what
-        # changed. The summary line "N files reformatted." also appears
-        # but we don't need it.
-        result["changed_files"] = [
-            line.removeprefix("reformatted ").strip()
-            for line in proc.stderr.splitlines()
-            if line.startswith("reformatted ")
-        ]
-        return result
+        # black logs "reformatted <path>" on stderr for each file it changes.
+        return BlackResult(
+            reformatted=[
+                line.removeprefix("reformatted ").strip()
+                for line in proc.stderr.splitlines()
+                if line.startswith("reformatted ")
+            ]
+        )
 
     def update_all_to_github(
         self,
         commit_message: str,
         pr_body: str | None = None,
         push_delay: float = 20.0,
-    ) -> dict[str, dict]:
+    ) -> dict[str, PublishResult]:
         """
-        Commit changes and push the working branch in all repos, opening a
-        pull request against the default branch.
+        Format, commit, push and open a PR in every repo.
 
-        Before committing, runs black across each repo and auto-fixes any
-        formatting. If black can't parse the source in any repo, the
-        entire estate-wide publish is aborted - no PRs are opened. This
-        prevents the common failure of opening PRs that immediately fail
-        CI's ``black --check``.
-
-        Args:
-            commit_message: Message for commits, also used as the PR title.
-            pr_body: PR body. Defaults to a generated description.
-            push_delay: Seconds to wait between pushes, to spread
-                downstream webhook fan-out (e.g. ReadTheDocs build queue)
-                across time when publishing many PRs at once. Defaults
-                to 20s; pass 0 to disable. Skipped after the final push.
-
-        Returns:
-            Dict mapping repo names to update results.
-
-        Raises:
-            RuntimeError: If black fails (parse error or missing) in any
-                repo. No commits or pushes happen.
+        black runs over every repo first and any failure aborts before anything
+        is committed, so no PR opens only to fail CI's ``black --check``. The
+        commit message doubles as the PR title. ``push_delay`` is the pause in
+        seconds between pushes, which spreads out the ReadTheDocs build queue.
         """
         if pr_body is None:
             pr_body = (
@@ -716,47 +617,38 @@ class RepoManager:
                 f"Commit: {commit_message}"
             )
 
-        # Format every repo with black before any commit. Run all repos
-        # before checking failures so the operator gets a complete picture
-        # of what's wrong rather than the first failure only.
+        # Every repo is formatted before failures are reported, so the operator
+        # sees all of them at once.
         format_results = {
             repo.name: self.format_with_black(repo) for repo in self.repos
         }
-        failures = [r for r in format_results.values() if r["failed"]]
+        failures = {name: r for name, r in format_results.items() if r.failure}
         if failures:
-            for r in failures:
-                print(f"\n  {r['repo']}: {r['failure_reason']}")
-                for line in r.get("stderr_tail", "").splitlines():
+            for name, r in failures.items():
+                print(f"\n  {name}: {r.failure}")
+                for line in r.stderr_tail.splitlines():
                     print(f"    {line}")
             raise RuntimeError(
                 f"black failed in {len(failures)} repo(s); aborting publish. "
                 "No commits or PRs were created."
             )
-        total_reformatted = sum(
-            len(r["changed_files"]) for r in format_results.values()
-        )
+        total_reformatted = sum(len(r.reformatted) for r in format_results.values())
         if total_reformatted:
             print(f"\nblack reformatted {total_reformatted} file(s):")
             for name, r in format_results.items():
-                if r["changed_files"]:
-                    print(f"  {name}: {len(r['changed_files'])} file(s)")
+                if r.reformatted:
+                    print(f"  {name}: {len(r.reformatted)} file(s)")
 
         results = {}
         last_idx = len(self.repos) - 1
         for idx, repo in enumerate(self.repos):
-            commit_result = self.commit_changes(repo, commit_message)
-            # Always attempt push; push_changes self-skips when there are no
-            # commits ahead. This way pre-existing commits on the working
-            # branch (e.g. from a manual commit before make-prs) still get
-            # published.
-            push_result = self.push_changes(repo, commit_message, pr_body)
+            committed = self.commit_changes(repo, commit_message)
+            # Push even without a new commit: the branch may carry commits made
+            # by hand before make-prs.
+            pushed = self.push_changes(repo, commit_message, pr_body)
+            results[repo.name] = PublishResult(committed, pushed)
 
-            results[repo.name] = {
-                "commit": commit_result,
-                "push": push_result,
-            }
-
-            if push_delay and idx < last_idx and push_result["action"] == "push":
+            if push_delay and pushed and idx < last_idx:
                 print(f"  sleeping {push_delay:g}s before next push...")
                 time.sleep(push_delay)
 
@@ -767,64 +659,29 @@ class RepoManager:
     # =========================================================================
 
     @staticmethod
-    def build_repo(repo: RepoCheckout) -> dict:
+    def build_repo(repo: RepoCheckout) -> BuildResult:
         """
-        Build a repo's Sphinx docs in a fresh venv in an external scratch dir.
+        Build a repo's Sphinx docs in a fresh venv from its ``requirements.txt``.
 
-        The venv and Sphinx output both live in a scratch directory under
-        ``/tmp/iati-build-<repo>-<rand>/`` - never inside the repo. This
-        keeps the candidate's working tree untouched even when the caller
-        passes a local checkout (e.g. via ``build-compare --dir``).
-
-        ``requirements.txt`` is installed from the repo (which pins the same
-        Sphinx / theme versions ReadTheDocs uses). The build is invoked from
-        the ``docs/`` directory so any conf.py imports of sibling modules
-        (``from project_info import ...``) resolve. ``PYTHONDONTWRITEBYTECODE``
-        is set on the build subprocess so importing conf.py doesn't leave
-        ``__pycache__`` in the repo's ``docs/``.
-
-        Scratch directories are NOT cleaned up. macOS prunes ``/tmp`` files
-        older than ~3 days, which is plenty of time to inspect a failed
-        build manually.
-
-        Returns:
-            Dict with structured build results:
-                stage: "install" or "build" or "complete"
-                failed: bool
-                failure_reason: str (if failed)
-                install_exit_code, install_stderr_tail
-                build_exit_code, build_stderr_tail
-                pages: sorted list of HTML pages produced
-                  (paths relative to html_dir, empty if build failed)
-                warnings: list of Sphinx warning lines from stderr
-                scratch_dir: path to the build scratch dir
-                html_dir: path to the directory containing the built HTML
-                  (only set on a successful build)
+        The venv and HTML go in a scratch dir under ``/tmp``, never inside the
+        repo, so a local checkout passed to ``build-compare`` stays untouched.
+        The scratch dir is left behind for inspection.
         """
-        result = {
-            "repo": repo.name,
-            "stage": "install",
-            "failed": False,
-            "pages": [],
-            "warnings": [],
-        }
+        result = BuildResult(repo.name)
 
         docs_dir = repo.path / "docs"
         if not docs_dir.is_dir():
-            result["failed"] = True
-            result["failure_reason"] = f"No docs/ directory in {repo.name}"
+            result.failure = f"No docs/ directory in {repo.name}"
             return result
 
         requirements = repo.path / "requirements.txt"
         if not requirements.is_file():
-            result["failed"] = True
-            result["failure_reason"] = f"No requirements.txt in {repo.name}"
+            result.failure = f"No requirements.txt in {repo.name}"
             return result
 
         scratch_dir = Path(
             tempfile.mkdtemp(prefix=f"iati-build-{repo.name}-", dir="/tmp")
         )
-        result["scratch_dir"] = str(scratch_dir)
         venv_path = scratch_dir / "venv"
         html_dir = scratch_dir / "html"
 
@@ -834,37 +691,28 @@ class RepoManager:
             text=True,
         )
         if venv_proc.returncode != 0:
-            result["failed"] = True
-            result["failure_reason"] = "venv creation failed"
-            result["install_stderr_tail"] = "\n".join(
-                venv_proc.stderr.splitlines()[-30:]
-            )
+            result.failure = "venv creation failed"
+            result.install_stderr_tail = _tail(venv_proc.stderr, 30)
             return result
 
-        pip_path = venv_path / "bin" / "pip"
-        py_path = venv_path / "bin" / "python"
-
         install_proc = subprocess.run(
-            [str(pip_path), "install", "-q", "-r", str(requirements)],
+            [str(venv_path / "bin" / "pip"), "install", "-q", "-r", str(requirements)],
             capture_output=True,
             text=True,
         )
-        result["install_exit_code"] = install_proc.returncode
-        result["install_stderr_tail"] = "\n".join(
-            install_proc.stderr.splitlines()[-30:]
-        )
+        result.install_exit_code = install_proc.returncode
+        result.install_stderr_tail = _tail(install_proc.stderr, 30)
         if install_proc.returncode != 0:
-            result["failed"] = True
-            result["failure_reason"] = "pip install failed"
+            result.failure = "pip install failed"
             return result
 
-        result["stage"] = "build"
-        # PYTHONDONTWRITEBYTECODE keeps Python from leaving __pycache__/
-        # in the repo's docs/ when Sphinx imports conf.py and project_info.
+        result.stage = "build"
+        # Stops Python leaving __pycache__/ in the repo's docs/ when Sphinx
+        # imports conf.py and project_info.
         env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
         build_proc = subprocess.run(
             [
-                str(py_path),
+                str(venv_path / "bin" / "python"),
                 "-m",
                 "sphinx",
                 "-b",
@@ -877,34 +725,31 @@ class RepoManager:
             text=True,
             env=env,
         )
-        result["build_exit_code"] = build_proc.returncode
-        result["build_stderr_tail"] = "\n".join(build_proc.stderr.splitlines()[-30:])
-        # Sphinx writes warnings to stderr in the form
-        # "/path/file.rst:N: WARNING: ..." - keep just those lines, and
-        # strip the absolute repo path so warnings produced from two
-        # different checkouts of the same code compare equal.
+        result.build_exit_code = build_proc.returncode
+        result.build_stderr_tail = _tail(build_proc.stderr, 30)
+        # The absolute repo path is stripped so warnings from two checkouts of
+        # the same code compare equal.
         repo_prefix = str(repo.path.resolve()) + "/"
-        result["warnings"] = [
+        result.warnings = [
             line.replace(repo_prefix, "")
             for line in build_proc.stderr.splitlines()
             if "WARNING:" in line or "ERROR:" in line
         ]
 
         if build_proc.returncode != 0:
-            result["failed"] = True
-            result["failure_reason"] = "sphinx build failed"
+            result.failure = "sphinx build failed"
             return result
 
         if html_dir.is_dir():
-            result["pages"] = sorted(
+            result.pages = sorted(
                 str(p.relative_to(html_dir)) for p in html_dir.rglob("*.html")
             )
-            result["html_dir"] = str(html_dir)
+            result.html_dir = html_dir
 
-        result["stage"] = "complete"
+        result.stage = "complete"
         return result
 
-    def build_all_repos(self) -> dict[str, dict]:
+    def build_all_repos(self) -> dict[str, BuildResult]:
         """
         Build every checked-out repo at its default branch.
 
@@ -935,7 +780,7 @@ class RepoManager:
         if self.template is not None:
             repos_to_build.insert(0, self.template)
 
-        results: dict[str, dict] = {}
+        results = {}
         for repo in repos_to_build:
             git("checkout", self.default_branch(repo.path), cwd=repo.path)
             print(f"Building {repo.name}...")
@@ -979,7 +824,7 @@ class RepoManager:
     def build_compare(
         candidate_repo: RepoCheckout,
         baseline_ref: str = "main",
-    ) -> dict:
+    ) -> BuildComparison:
         """
         Build candidate and baseline, return a structured change report.
 
@@ -999,18 +844,8 @@ class RepoManager:
             baseline_ref: Git ref of the same repo to compare against
                 (default: ``main``).
 
-        Returns:
-            Dict with:
-                baseline, candidate: per-side build results
-                baseline_ref, candidate_label
-                pages_added: pages in candidate not present in baseline
-                pages_removed: pages in baseline not present in candidate
-                pages_modified: {page_name: unified diff string} for pages
-                    on both sides whose content differs post-normalisation
-                warnings_added: warning lines new in candidate
-                warnings_removed: warning lines gone from candidate
-                baseline_scratch: where the baseline clone lives, for manual
-                    deeper inspection
+        ``pages_modified`` in the result maps each page that differs after
+        normalisation to its unified diff.
         """
         url = clone_url(candidate_repo.name)
 
@@ -1027,7 +862,7 @@ class RepoManager:
             )
 
         print(f"Building candidate ({candidate_repo.name})...")
-        candidate_result = RepoManager.build_repo(candidate_repo)
+        candidate = RepoManager.build_repo(candidate_repo)
 
         baseline_scratch = Path(
             tempfile.mkdtemp(prefix=f"iati-baseline-{candidate_repo.name}-", dir="/tmp")
@@ -1037,36 +872,20 @@ class RepoManager:
         git("clone", "--depth", "1", "--branch", baseline_ref, url, str(baseline_path))
         baseline_repo = RepoCheckout(name=candidate_repo.name, path=baseline_path)
         print(f"Building baseline ({baseline_ref})...")
-        baseline_result = RepoManager.build_repo(baseline_repo)
+        baseline = RepoManager.build_repo(baseline_repo)
 
-        candidate_label = (
-            RepoManager._current_branch(candidate_repo.path) or "candidate"
-        )
-
-        baseline_pages = set(baseline_result.get("pages", []))
-        candidate_pages = set(candidate_result.get("pages", []))
-        pages_added = sorted(candidate_pages - baseline_pages)
-        pages_removed = sorted(baseline_pages - candidate_pages)
+        baseline_pages = set(baseline.pages)
+        candidate_pages = set(candidate.pages)
 
         # Both sides only have html_dir set if the build actually succeeded.
         # If either failed, skip the per-page diff (the warnings/pages_added
         # sections still carry signal).
-        baseline_html_dir = (
-            Path(baseline_result["html_dir"])
-            if baseline_result.get("html_dir")
-            else None
-        )
-        candidate_html_dir = (
-            Path(candidate_result["html_dir"])
-            if candidate_result.get("html_dir")
-            else None
-        )
         pages_modified: dict[str, str] = {}
         for page in sorted(baseline_pages & candidate_pages):
-            if baseline_html_dir is None or candidate_html_dir is None:
+            if baseline.html_dir is None or candidate.html_dir is None:
                 break
-            baseline_file = baseline_html_dir / page
-            candidate_file = candidate_html_dir / page
+            baseline_file = baseline.html_dir / page
+            candidate_file = candidate.html_dir / page
             if not baseline_file.is_file() or not candidate_file.is_file():
                 continue
             try:
@@ -1078,32 +897,27 @@ class RepoManager:
             if diff is not None:
                 pages_modified[page] = diff
 
-        baseline_warnings_set = set(baseline_result.get("warnings", []))
-        candidate_warnings_set = set(candidate_result.get("warnings", []))
-        warnings_added = [
-            w
-            for w in candidate_result.get("warnings", [])
-            if w not in baseline_warnings_set
-        ]
-        warnings_removed = [
-            w
-            for w in baseline_result.get("warnings", [])
-            if w not in candidate_warnings_set
-        ]
-
-        return {
-            "repo": candidate_repo.name,
-            "baseline_ref": baseline_ref,
-            "candidate_label": candidate_label,
-            "baseline": baseline_result,
-            "candidate": candidate_result,
-            "pages_added": pages_added,
-            "pages_removed": pages_removed,
-            "pages_modified": pages_modified,
-            "warnings_added": warnings_added,
-            "warnings_removed": warnings_removed,
-            "baseline_scratch": str(baseline_scratch),
-        }
+        baseline_warnings = set(baseline.warnings)
+        candidate_warnings = set(candidate.warnings)
+        return BuildComparison(
+            repo=candidate_repo.name,
+            baseline_ref=baseline_ref,
+            candidate_label=(
+                RepoManager._current_branch(candidate_repo.path) or "candidate"
+            ),
+            baseline=baseline,
+            candidate=candidate,
+            pages_added=sorted(candidate_pages - baseline_pages),
+            pages_removed=sorted(baseline_pages - candidate_pages),
+            pages_modified=pages_modified,
+            warnings_added=[
+                w for w in candidate.warnings if w not in baseline_warnings
+            ],
+            warnings_removed=[
+                w for w in baseline.warnings if w not in candidate_warnings
+            ],
+            baseline_scratch=baseline_scratch,
+        )
 
     # =========================================================================
     # CLEANUP
@@ -1147,66 +961,33 @@ class RepoManager:
 # =============================================================================
 
 
-def sync_gitignore_entries(repo: RepoCheckout) -> dict:
+def sync_gitignore_entries(repo: RepoCheckout) -> FileCheck:
     """
-    Additive sync: ensure a repo's ``.gitignore`` contains every entry in
-    ``GITIGNORE_BASELINE``.
+    Append any missing ``GITIGNORE_BASELINE`` entries to a repo's ``.gitignore``.
 
-    Unlike a template-file sync, this never replaces, removes, or reorders
-    a repo's existing entries - it only appends the missing baseline ones.
-    Matching is line-based, not substring: a repo that already ignores
-    ``scripts/__pycache__/`` still gets the un-anchored ``__pycache__/``
-    appended, because the narrow entry doesn't cover ``docs/``.
-
-    Edits the working tree in place; the caller commits and PRs whatever
-    changed via ``update_all_to_github``.
+    Matching is by whole line, so a narrower entry such as
+    ``scripts/__pycache__/`` does not count as covering ``__pycache__/``.
     """
     gitignore = repo.path / ".gitignore"
-    result = {"repo": repo.name, "file": ".gitignore", "action": None}
-
-    if gitignore.exists():
-        content = gitignore.read_text()
-        existing = {line.strip() for line in content.splitlines()}
-    else:
-        content = ""
-        existing = set()
+    existed = gitignore.exists()
+    content = gitignore.read_text() if existed else ""
+    existing = {line.strip() for line in content.splitlines()}
 
     missing = [e for e in GITIGNORE_BASELINE if e not in existing]
-
     if not missing:
-        result["action"] = "skip"
-        result["reason"] = "All baseline entries present"
-        return result
-
-    result["action"] = "create" if not gitignore.exists() else "update"
-    result["entries_added"] = missing
+        return FileCheck(".gitignore", FileState.MATCH)
 
     if content and not content.endswith("\n"):
         content += "\n"
-    content += "\n".join(missing) + "\n"
-    gitignore.write_text(content)
-
-    return result
+    gitignore.write_text(content + "\n".join(missing) + "\n")
+    state = FileState.DIFFERS if existed else FileState.MISSING_IN_REPO
+    return FileCheck(".gitignore", state)
 
 
 # =============================================================================
 # CLI INTERFACE
 # =============================================================================
 
-
-def _file_result_status(r: dict) -> str:
-    """Classify a per-file check or sync result for the operator."""
-    if r.get("matches"):
-        return "OK"
-    if r.get("error") or r.get("diff"):
-        return "NEEDS ATTENTION"
-    if r.get("action") == "skip":
-        # Skip is only OK if the file already matches the template; a skip
-        # caused by a missing template file is a config problem.
-        if r.get("reason") == "Template file does not exist":
-            return "NEEDS ATTENTION"
-        return "OK"
-    return "NEEDS ATTENTION"
 
 
 def _print_header(heading: str) -> None:
@@ -1216,32 +997,46 @@ def _print_header(heading: str) -> None:
     print("=" * 60)
 
 
-def print_results(results: dict, title: str, show_diff: bool = True) -> None:
-    """Pretty print results."""
+_CHECK_NOTES = {
+    FileState.MISSING_IN_TEMPLATE: "Error: Template file does not exist",
+    FileState.MISSING_IN_REPO: "Error: File missing from repo",
+}
+_SYNC_NOTES = {
+    FileState.MISSING_IN_REPO: "Action: create",
+    FileState.DIFFERS: "Action: update",
+}
+
+
+def print_file_results(
+    results: dict[str, list[FileCheck]],
+    title: str,
+    notes: dict[FileState, str],
+    show_diff: bool = False,
+) -> None:
+    """Print each repo's per-file state, annotated from ``notes``."""
     _print_header(title)
 
-    for repo_name, repo_results in results.items():
+    for repo_name, checks in results.items():
         print(f"\n{repo_name}:")
-        if isinstance(repo_results, list):
-            for r in repo_results:
-                file_name = r.get("file", "check")
-                print(f"  {file_name}: {_file_result_status(r)}")
-                if r.get("error"):
-                    print(f"    Error: {r['error']}")
-                if r.get("action") and r["action"] != "skip":
-                    print(f"    Action: {r['action']}")
-                if show_diff and r.get("diff"):
-                    print(f"\n    --- Diff for {file_name} ---")
-                    # Indent each line of the diff for readability
-                    for line in r["diff"].splitlines():
-                        print(f"    {line}")
-                    print(f"    --- End diff ---\n")
-        elif isinstance(repo_results, dict):
-            for key, value in repo_results.items():
-                if isinstance(value, dict):
-                    print(f"  {key}: {value.get('action', value)}")
-                else:
-                    print(f"  {key}: {value}")
+        for check in checks:
+            status = "OK" if check.state is FileState.MATCH else "NEEDS ATTENTION"
+            print(f"  {check.path}: {status}")
+            if check.state in notes:
+                print(f"    {notes[check.state]}")
+            if show_diff and check.diff:
+                print(f"\n    --- Diff for {check.path} ---")
+                for line in check.diff.splitlines():
+                    print(f"    {line}")
+                print(f"    --- End diff ---\n")
+
+
+def print_publish_results(results: dict[str, PublishResult]) -> None:
+    _print_header("COMMIT + PUSH + PR")
+
+    for repo_name, r in results.items():
+        print(f"\n{repo_name}:")
+        print(f"  commit: {'commit' if r.committed else 'skip'}")
+        print(f"  push: {'push' if r.pushed else 'skip'}")
 
 
 def _age_str(iso_dt: str) -> str:
@@ -1437,20 +1232,18 @@ def print_extra_paths(extras: dict[str, list[str]]) -> None:
             print(f"  - {p}")
 
 
-def print_run_script_results(results: dict) -> None:
-    """Pretty print run-script results: repo, exit code, stdout, stderr."""
+def print_run_script_results(results: dict[str, ScriptResult]) -> None:
     _print_header("RUN-SCRIPT RESULTS")
 
     for repo_name, r in results.items():
         print(f"\n{repo_name}:")
-        if r.get("failed"):
-            print(f"  FAILED: {r['failure_reason']}")
+        if r.failure:
+            print(f"  FAILED: {r.failure}")
 
-        if "exit" in r:
-            print(f"  exit: {r['exit']}")
-        stdout = r.get("stdout", "").rstrip()
-        stderr = r.get("stderr", "").rstrip()
-        changed = r.get("changed_files") or []
+        if r.exit_code is not None:
+            print(f"  exit: {r.exit_code}")
+        stdout = r.stdout.rstrip()
+        stderr = r.stderr.rstrip()
 
         if stdout:
             print("  stdout:")
@@ -1460,44 +1253,44 @@ def print_run_script_results(results: dict) -> None:
             print("  stderr:")
             for line in stderr.splitlines():
                 print(f"    {line}")
-        if changed:
-            print(f"  changed: {len(changed)} file(s)")
-            for line in changed:
+        if r.changed_files:
+            print(f"  changed: {len(r.changed_files)} file(s)")
+            for line in r.changed_files:
                 print(f"    {line}")
-        if not r.get("failed") and not stdout and not stderr and not changed:
+        if not (r.failure or stdout or stderr or r.changed_files):
             print("  (no output, no changes)")
 
 
-def print_build_result(result: dict) -> None:
+def print_build_result(result: BuildResult) -> None:
     """Print a single build_repo result in human-readable form."""
-    _print_header(f"BUILD: {result['repo']}")
-    if result["failed"]:
-        print(f"  FAILED at stage '{result['stage']}': {result['failure_reason']}")
+    _print_header(f"BUILD: {result.repo}")
+    if result.failed:
+        print(f"  FAILED at stage '{result.stage}': {result.failure}")
     else:
         print("  OK")
-    if "install_exit_code" in result:
-        print(f"  install exit:    {result['install_exit_code']}")
-    if "build_exit_code" in result:
-        print(f"  sphinx exit:     {result['build_exit_code']}")
-    print(f"  warnings:        {len(result.get('warnings', []))}")
-    print(f"  pages produced:  {len(result.get('pages', []))}")
-    if result.get("warnings"):
+    if result.install_exit_code is not None:
+        print(f"  install exit:    {result.install_exit_code}")
+    if result.build_exit_code is not None:
+        print(f"  sphinx exit:     {result.build_exit_code}")
+    print(f"  warnings:        {len(result.warnings)}")
+    print(f"  pages produced:  {len(result.pages)}")
+    if result.warnings:
         print("  warning lines:")
-        for w in result["warnings"][:20]:
+        for w in result.warnings[:20]:
             print(f"    {w}")
-        if len(result["warnings"]) > 20:
-            print(f"    ... ({len(result['warnings']) - 20} more)")
-    if result.get("install_stderr_tail") and result["failed"]:
+        if len(result.warnings) > 20:
+            print(f"    ... ({len(result.warnings) - 20} more)")
+    if result.install_stderr_tail and result.failed:
         print("  install stderr tail:")
-        for line in result["install_stderr_tail"].splitlines():
+        for line in result.install_stderr_tail.splitlines():
             print(f"    {line}")
-    if result.get("build_stderr_tail") and result["failed"]:
+    if result.build_stderr_tail and result.failed:
         print("  build stderr tail:")
-        for line in result["build_stderr_tail"].splitlines():
+        for line in result.build_stderr_tail.splitlines():
             print(f"    {line}")
 
 
-def print_build_all_results(results: dict[str, dict]) -> None:
+def print_build_all_results(results: dict[str, BuildResult]) -> None:
     """One-line summary per repo for build-all."""
     print(f"\n{'=' * 72}")
     print(" BUILD-ALL SUMMARY")
@@ -1505,24 +1298,24 @@ def print_build_all_results(results: dict[str, dict]) -> None:
     print(f"  {'repo':<40} {'status':<10} {'warns':>6} {'pages':>6}")
     print(f"  {'-' * 40} {'-' * 10} {'-' * 6} {'-' * 6}")
     for repo_name, r in results.items():
-        status = "FAIL" if r["failed"] else "OK"
-        warns = len(r.get("warnings", []))
-        pages = len(r.get("pages", []))
+        status = "FAIL" if r.failed else "OK"
+        warns = len(r.warnings)
+        pages = len(r.pages)
         print(f"  {repo_name:<40} {status:<10} {warns:>6} {pages:>6}")
-    failures = [n for n, r in results.items() if r["failed"]]
+    failures = [n for n, r in results.items() if r.failed]
     if failures:
         print(f"\n  {len(failures)} repo(s) failed: {', '.join(failures)}")
         for name in failures:
             r = results[name]
             print(f"\n  --- {name} failure detail ---")
-            print(f"    stage: {r['stage']}")
-            print(f"    reason: {r.get('failure_reason', 'unknown')}")
-            tail = r.get("build_stderr_tail") or r.get("install_stderr_tail") or ""
+            print(f"    stage: {r.stage}")
+            print(f"    reason: {r.failure}")
+            tail = r.build_stderr_tail or r.install_stderr_tail
             for line in tail.splitlines()[-15:]:
                 print(f"    {line}")
 
 
-def print_build_compare(comparison: dict) -> None:
+def print_build_compare(comparison: BuildComparison) -> None:
     """
     Print a build_compare change report.
 
@@ -1531,43 +1324,41 @@ def print_build_compare(comparison: dict) -> None:
     to the operator rolling out the change.
     """
     print(f"\n{'=' * 72}")
-    print(f" BUILD-COMPARE: {comparison['repo']}")
-    print(f"   baseline:  {comparison['baseline_ref']}")
-    print(f"   candidate: {comparison['candidate_label']}")
+    print(f" BUILD-COMPARE: {comparison.repo}")
+    print(f"   baseline:  {comparison.baseline_ref}")
+    print(f"   candidate: {comparison.candidate_label}")
     print("=" * 72)
 
-    baseline = comparison["baseline"]
-    candidate = comparison["candidate"]
+    baseline = comparison.baseline
+    candidate = comparison.candidate
     print(
-        f"  baseline:  {'FAIL' if baseline['failed'] else 'OK':<5}  "
-        f"warns={len(baseline.get('warnings', []))}  "
-        f"pages={len(baseline.get('pages', []))}"
+        f"  baseline:  {'FAIL' if baseline.failed else 'OK':<5}  "
+        f"warns={len(baseline.warnings)}  "
+        f"pages={len(baseline.pages)}"
     )
     print(
-        f"  candidate: {'FAIL' if candidate['failed'] else 'OK':<5}  "
-        f"warns={len(candidate.get('warnings', []))}  "
-        f"pages={len(candidate.get('pages', []))}"
+        f"  candidate: {'FAIL' if candidate.failed else 'OK':<5}  "
+        f"warns={len(candidate.warnings)}  "
+        f"pages={len(candidate.pages)}"
     )
 
     # If the candidate failed to build, surface that first - downstream
     # sections may be empty or misleading. Don't suppress them; the
     # operator may still want to see partial output.
-    if candidate["failed"] and not baseline["failed"]:
-        print(f"\n  Candidate build did not complete (stage: {candidate['stage']}).")
-        print(f"  Reason: {candidate.get('failure_reason', 'unknown')}")
-        tail = candidate.get("build_stderr_tail") or candidate.get(
-            "install_stderr_tail"
-        )
+    if candidate.failed and not baseline.failed:
+        print(f"\n  Candidate build did not complete (stage: {candidate.stage}).")
+        print(f"  Reason: {candidate.failure}")
+        tail = candidate.build_stderr_tail or candidate.install_stderr_tail
         if tail:
             print("  stderr tail:")
             for line in tail.splitlines()[-15:]:
                 print(f"    {line}")
 
-    pages_added = comparison["pages_added"]
-    pages_removed = comparison["pages_removed"]
-    pages_modified = comparison["pages_modified"]
-    warnings_added = comparison["warnings_added"]
-    warnings_removed = comparison["warnings_removed"]
+    pages_added = comparison.pages_added
+    pages_removed = comparison.pages_removed
+    pages_modified = comparison.pages_modified
+    warnings_added = comparison.warnings_added
+    warnings_removed = comparison.warnings_removed
 
     if pages_added:
         print(f"\n  Pages added ({len(pages_added)}):")
@@ -1614,15 +1405,15 @@ def print_build_compare(comparison: dict) -> None:
     nothing_changed = not any(
         [pages_added, pages_removed, pages_modified, warnings_added, warnings_removed]
     )
-    if nothing_changed and not candidate["failed"]:
+    if nothing_changed and not candidate.failed:
         print("\n  No differences detected.")
 
     # Only advertise the scratch checkout when there's actually something
     # to inspect. macOS prunes /tmp eventually either way.
-    if not nothing_changed or candidate["failed"]:
+    if not nothing_changed or candidate.failed:
         print(
             f"\n  Baseline checkout (for further inspection): "
-            f"{comparison['baseline_scratch']}"
+            f"{comparison.baseline_scratch}"
         )
 
 
@@ -2023,7 +1814,7 @@ def main():
             git("checkout", default, cwd=checkout.path)
             result = manager.build_repo(checkout)
             print_build_result(result)
-            return 0 if not result["failed"] else 1
+            return 1 if result.failed else 0
 
     if args.command == "build-all":
         with RepoManager() as manager:
@@ -2032,7 +1823,7 @@ def main():
             manager.checkout_all()
             results = manager.build_all_repos()
             print_build_all_results(results)
-            failures = [r for r in results.values() if r["failed"]]
+            failures = [r for r in results.values() if r.failed]
             return 1 if failures else 0
 
     if args.command == "build-compare":
@@ -2080,8 +1871,8 @@ def main():
         # itself failed to build while the baseline succeeded. Content
         # differences are reported, not adjudicated - the operator judges
         # whether each diff matches their intent.
-        candidate_failed = comparison["candidate"]["failed"]
-        baseline_failed = comparison["baseline"]["failed"]
+        candidate_failed = comparison.candidate.failed
+        baseline_failed = comparison.baseline.failed
         return 1 if candidate_failed and not baseline_failed else 0
 
     if args.command == "make-prs":
@@ -2124,7 +1915,7 @@ def main():
             pr_body=args.pr_body,
             push_delay=args.push_delay,
         )
-        print_results(push_results, "COMMIT + PUSH + PR")
+        print_publish_results(push_results)
         return
 
     # Pick a branch name. run-script uses a script-specific prefix so its
@@ -2150,7 +1941,9 @@ def main():
                 ]
                 for repo in manager.repos
             }
-            print_results(results, "CHECK RESULTS", show_diff=not args.no_diff)
+            print_file_results(
+                results, "CHECK RESULTS", _CHECK_NOTES, show_diff=not args.no_diff
+            )
 
             extras = {
                 repo.name: manager.extra_top_level_paths(repo)
@@ -2161,10 +1954,9 @@ def main():
             # Summary
             total_files = sum(len(r) for r in results.values())
             matching = sum(
-                1
-                for repo_results in results.values()
-                for r in repo_results
-                if r.get("matches")
+                check.state is FileState.MATCH
+                for checks in results.values()
+                for check in checks
             )
             print(f"\nSummary: {matching}/{total_files} files match template")
 
@@ -2175,27 +1967,27 @@ def main():
                 ]
                 for repo in manager.repos
             }
-            print_results(copy_results, "FILE COPY")
+            print_file_results(copy_results, "FILE COPY", _SYNC_NOTES)
 
             push_results = manager.update_all_to_github(
                 args.message,
                 pr_body=args.pr_body,
                 push_delay=args.push_delay,
             )
-            print_results(push_results, "COMMIT + PUSH + PR")
+            print_publish_results(push_results)
 
         elif args.command == "sync-gitignore":
             sync_results = {
                 repo.name: [sync_gitignore_entries(repo)] for repo in manager.repos
             }
-            print_results(sync_results, "GITIGNORE SYNC")
+            print_file_results(sync_results, "GITIGNORE SYNC", _SYNC_NOTES)
 
             push_results = manager.update_all_to_github(
                 args.message,
                 pr_body=args.pr_body,
                 push_delay=args.push_delay,
             )
-            print_results(push_results, "COMMIT + PUSH + PR")
+            print_publish_results(push_results)
 
         elif args.command == "run-script":
             results = manager.run_script_on_all_repos(
@@ -2204,16 +1996,16 @@ def main():
             )
             print_run_script_results(results)
 
-            failed = next((r for r in results.values() if r.get("failed")), None)
+            failed = next((r for r in results.values() if r.failure), None)
             if failed:
                 print(
-                    f"\nERROR: Script failed in {failed['repo']} "
-                    f"({failed['failure_reason']}). "
+                    f"\nERROR: Script failed in {failed.repo} "
+                    f"({failed.failure}). "
                     "Aborting; no changes published."
                 )
                 return 1
 
-            repos_with_changes = [r for r in results.values() if r.get("changed_files")]
+            repos_with_changes = [r for r in results.values() if r.changed_files]
             if not repos_with_changes:
                 print("\nNo file changes; nothing to commit or push.")
                 return
@@ -2229,7 +2021,7 @@ def main():
                 pr_body=args.pr_body,
                 push_delay=args.push_delay,
             )
-            print_results(push_results, "COMMIT + PUSH + PR")
+            print_publish_results(push_results)
 
 
 if __name__ == "__main__":
