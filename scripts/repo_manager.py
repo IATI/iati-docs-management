@@ -9,6 +9,7 @@ template, syncing template files via pull request, and running arbitrary
 scripts in each repo.
 """
 
+import argparse
 import datetime
 import difflib
 import json
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -196,6 +198,10 @@ class BuildComparison:
     warnings_added: list[str]
     warnings_removed: list[str]
     baseline_scratch: Path
+
+
+class UsageError(Exception):
+    """A problem with the invocation, reported the way argparse reports its own."""
 
 
 def get_tagged_repos() -> list[str]:
@@ -543,7 +549,7 @@ def build_compare(
     # <ref> not found in upstream origin". Doing this up front avoids
     # ~30s of wasted candidate build on a typo.
     if not git("ls-remote", "--heads", "--tags", url, baseline_ref):
-        raise ValueError(
+        raise UsageError(
             f"Baseline ref {baseline_ref!r} is not a branch or tag in "
             f"{candidate_repo.name}. --baseline-ref accepts branch and "
             f"tag names only; commit SHAs are not supported."
@@ -1198,334 +1204,391 @@ def print_build_compare(comparison: BuildComparison) -> None:
         print("\n  No differences detected.")
 
 
-def main():
-    """Main CLI entry point."""
-    import argparse
+@contextmanager
+def checked_out_estate(branch_name: str):
+    """Clone the whole estate onto a working branch; remove the clones on exit."""
+    with RepoManager(branch_name) as manager:
+        print(f"Working directory: {manager.work_dir}")
+        print(f"Working branch: {manager.branch_name}")
+        print("Checking out repositories...")
+        manager.checkout_all()
+        print(f"Checked out {len(manager.repos)} repos (+ template)")
+        yield manager
 
+
+def publish(manager: RepoManager, args: argparse.Namespace) -> None:
+    results = manager.update_all_to_github(args.message, args.pr_body, args.push_delay)
+    print_publish_results(results)
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    print("Documentation repositories:")
+    for repo in get_tagged_repos():
+        marker = " (template)" if repo == TEMPLATE_REPO else ""
+        print(f"  - {repo}{marker}")
+
+
+def cmd_list_prs(args: argparse.Namespace) -> None:
+    print_open_prs(list_open_prs())
+
+
+def cmd_check_protection(args: argparse.Namespace) -> None:
+    print_protection({name: get_branch_protection(name) for name in get_tagged_repos()})
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    with checked_out_estate(generate_branch_name()) as manager:
+        results = {
+            repo.name: [check_file(manager.template, repo, f) for f in args.files]
+            for repo in manager.repos
+        }
+        print_file_results(
+            results, "CHECK RESULTS", _CHECK_NOTES, show_diff=not args.no_diff
+        )
+        print_extra_paths(
+            {
+                repo.name: extra_top_level_paths(manager.template, repo)
+                for repo in manager.repos
+            }
+        )
+
+        checks = [check for repo_checks in results.values() for check in repo_checks]
+        matching = sum(check.state is FileState.MATCH for check in checks)
+        print(f"\nSummary: {matching}/{len(checks)} files match template")
+
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    with checked_out_estate(args.branch_name or generate_branch_name()) as manager:
+        results = {
+            repo.name: [sync_file(manager.template, repo, f) for f in args.files]
+            for repo in manager.repos
+        }
+        print_file_results(results, "FILE COPY", _SYNC_NOTES)
+        publish(manager, args)
+
+
+def cmd_sync_gitignore(args: argparse.Namespace) -> None:
+    branch_name = args.branch_name or generate_branch_name("gitignore")
+    with checked_out_estate(branch_name) as manager:
+        results = {repo.name: [sync_gitignore_entries(repo)] for repo in manager.repos}
+        print_file_results(results, "GITIGNORE SYNC", _SYNC_NOTES)
+        publish(manager, args)
+
+
+def cmd_run_script(args: argparse.Namespace) -> int:
+    branch_name = args.branch_name or generate_branch_name(
+        f"script-{Path(args.script).stem}"
+    )
+    with checked_out_estate(branch_name) as manager:
+        results = manager.run_script_on_all_repos(args.script, args.include_template)
+        print_run_script_results(results)
+
+        failed = next((r for r in results.values() if r.failure), None)
+        if failed:
+            print(
+                f"\nERROR: Script failed in {failed.repo} "
+                f"({failed.failure}). "
+                "Aborting; no changes published."
+            )
+            return 1
+
+        changed = [r for r in results.values() if r.changed_files]
+        if not changed:
+            print("\nNo file changes; nothing to commit or push.")
+            return 0
+        if not args.message:
+            raise UsageError(
+                f"Script produced changes in {len(changed)} "
+                "repo(s); pass -m to commit and open PRs."
+            )
+        publish(manager, args)
+        return 0
+
+
+def cmd_checkout_all(args: argparse.Namespace) -> None:
+    # No context manager: the checkouts must outlive this command for make-prs.
+    manager = RepoManager(args.branch_name or generate_branch_name("refactor"))
+    print(f"Working directory: {manager.work_dir}")
+    print(f"Working branch: {manager.branch_name}")
+    print("Checking out repositories...")
+    manager.checkout_all(include_template=not args.no_template)
+    print(f"\nCheckouts ready in: {manager.work_dir}")
+    print(f"Branch in each repo:  {manager.branch_name}")
+    print("\nNext: edit files in the checkouts, then run:")
+    print(
+        f"  python scripts/repo_manager.py make-prs "
+        f"--dir {manager.work_dir} -m 'Your commit message'"
+    )
+
+
+def cmd_make_prs(args: argparse.Namespace) -> None:
+    work_dir = Path(args.dir)
+    if not work_dir.is_dir():
+        raise UsageError(f"--dir {work_dir} is not a directory")
+
+    checkouts = sorted(
+        p
+        for p in work_dir.iterdir()
+        if p.is_dir() and (p / ".git").exists() and p.name != TEMPLATE_REPO
+    )
+    if not checkouts:
+        print(f"No repository checkouts found in {work_dir}")
+        return
+
+    branch_name = args.branch_name or current_branch(checkouts[0])
+    if not branch_name:
+        raise UsageError(
+            f"Could not detect branch from {checkouts[0]} "
+            "(detached HEAD?). Pass --branch-name."
+        )
+
+    # No context manager: the checkouts must survive for re-runs.
+    manager = RepoManager(
+        branch_name, work_dir, [RepoCheckout(p.name, p) for p in checkouts]
+    )
+    print(f"Working directory: {manager.work_dir}")
+    print(f"Working branch: {manager.branch_name}")
+    print(f"Repos to process: {len(manager.repos)}")
+    publish(manager, args)
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    with RepoManager() as manager:
+        print(f"Working directory: {manager.work_dir}")
+        result = build_repo(manager.checkout_repo(args.repo))
+        print_build_result(result)
+        return 1 if result.failed else 0
+
+
+def cmd_build_all(args: argparse.Namespace) -> int:
+    with RepoManager() as manager:
+        print(f"Working directory: {manager.work_dir}")
+        print("Checking out repositories...")
+        manager.checkout_all()
+        results = manager.build_all_repos()
+        print_build_all_results(results)
+        return 1 if any(r.failed for r in results.values()) else 0
+
+
+def cmd_build_compare(args: argparse.Namespace) -> int:
+    candidate_path = Path(args.dir).resolve()
+    if not candidate_path.is_dir() or not (candidate_path / ".git").is_dir():
+        raise UsageError(f"--dir {candidate_path} is not a git checkout")
+
+    # The baseline is cloned from IATI/<repo>, named by the candidate's origin
+    # remote or, failing that, its directory.
+    try:
+        source = git("remote", "get-url", "origin", cwd=candidate_path)
+        repo_name = source.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+    except subprocess.CalledProcessError:
+        source = f"directory name {candidate_path.name!r}"
+        repo_name = candidate_path.name
+
+    if repo_name not in get_tagged_repos():
+        raise UsageError(
+            f"Repo {repo_name!r} (inferred from {source}) is not in the "
+            f"Documentation-tagged estate. Either:\n"
+            f"  * --dir points at a checkout that isn't an IATI docs repo, or\n"
+            f"  * the upstream repo exists but isn't tagged Documentation=true "
+            f"(use `list` to see what is).\n"
+            f"Baselines are always cloned from IATI/<repo> on github.com."
+        )
+
+    comparison = build_compare(
+        RepoCheckout(repo_name, candidate_path), args.baseline_ref
+    )
+    print_build_compare(comparison)
+    return 1 if comparison.candidate.failed and not comparison.baseline.failed else 0
+
+
+def _add_publish_args(
+    parser: argparse.ArgumentParser, message_required: bool = True
+) -> None:
+    message_help = "Commit message, also used as the PR title"
+    if not message_required:
+        message_help += " (required if the script changes files)"
+    parser.add_argument("--message", "-m", required=message_required, help=message_help)
+    parser.add_argument(
+        "--branch-name",
+        help="Working branch name (default: generated; make-prs detects it "
+        "from the first checkout)",
+    )
+    parser.add_argument("--pr-body", help="Pull request body (default: generated)")
+    parser.add_argument(
+        "--push-delay",
+        type=float,
+        default=20.0,
+        metavar="SECONDS",
+        help="Pause between pushes, which spreads out the ReadTheDocs build "
+        "queue (default: 20; 0 disables)",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manage IATI documentation repositories.\n\n"
-        "Verbs:\n"
-        "  * 'list' and 'check' are read-only.\n"
-        "  * 'sync' commits, pushes, and opens a pull request against each\n"
-        "    repo's default branch. Use 'check' first to preview the diffs.\n"
-        "  * 'run-script' publishes automatically if the script produces\n"
-        "    filesystem changes; otherwise the run is informational. A\n"
-        "    non-zero exit in any repo aborts the run with no changes\n"
-        "    published.\n"
-        "  * 'checkout-all' + 'make-prs' is the manual-edit flow: clone\n"
-        "    every repo to a persistent dir, edit files by hand, then\n"
-        "    publish the lot as PRs in one go. Use this for cross-repo\n"
-        "    refactors that don't fit a template-sync or single script.",
+        description="Manage the IATI documentation estate. README.rst has the "
+        "full guide.\n\n"
+        "Read-only: list, list-prs, check-protection, check, build, build-all,\n"
+        "build-compare. Opens pull requests: sync, sync-gitignore, make-prs,\n"
+        "and run-script when the script changes files.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
-    # List repos command
-    subparsers.add_parser("list", help="List all tagged documentation repos")
+    def add_verb(name, func, help, description=None):
+        verb = subparsers.add_parser(
+            name,
+            help=help,
+            description=description or help,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        verb.set_defaults(func=func)
+        return verb
 
-    subparsers.add_parser(
+    add_verb("list", cmd_list, "List all tagged documentation repos")
+    add_verb(
         "list-prs",
-        help=(
-            "List open PRs across every Documentation-tagged repo, with "
-            "mergeability, CI rollup, and review status. Includes PRs from "
-            "anyone - useful for spotting in-flight work before stomping it."
-        ),
+        cmd_list_prs,
+        "List every open PR across the estate with merge, CI and review status",
     )
-
-    subparsers.add_parser(
+    add_verb(
         "check-protection",
-        help=(
-            "Show branch protection state for the default branch of every "
-            "Documentation-tagged repo. Read-only; never modifies protection."
-        ),
+        cmd_check_protection,
+        "Show branch protection on main for every repo",
     )
 
-    # Check command
-    check_parser = subparsers.add_parser("check", help="Check repos against template")
-    check_parser.add_argument(
-        "--files",
-        nargs="+",
-        default=FILES_TO_CHECK,
-        help="Files to check",
+    check = add_verb("check", cmd_check, "Check repos against template")
+    check.add_argument(
+        "--files", nargs="+", default=FILES_TO_CHECK, help="Files to check"
     )
-    check_parser.add_argument(
-        "--no-diff",
-        action="store_true",
-        help="Hide diff output for mismatched files",
+    check.add_argument(
+        "--no-diff", action="store_true", help="Hide diff output for mismatched files"
     )
 
-    # Sync command
-    sync_parser = subparsers.add_parser(
+    sync = add_verb(
         "sync",
-        help="Sync template files to repos and open PRs",
-        description="For each Documentation-tagged repo: copy the specified files from\n"
-        "iati-docs-base, commit them on a fresh working branch, push the\n"
-        "branch, and open a pull request against the repo's default branch.\n"
-        "Repos where every tracked file already matches the template are\n"
-        "skipped without producing a PR.\n\n"
-        "Use 'check' first if you want to preview the per-file diffs.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        cmd_sync,
+        "Sync template files to repos and open PRs",
+        "Copy the tracked files from iati-docs-base into every repo and open a\n"
+        "PR for each repo that changed. Run 'check' first to preview the diffs.",
     )
-    sync_parser.add_argument(
-        "--message",
-        "-m",
-        required=True,
-        help="Commit message (also used as PR title unless --pr-body overrides)",
-    )
-    sync_parser.add_argument(
+    sync.add_argument(
         "--files",
         nargs="+",
         default=FILES_TO_CHECK,
         help="Files to sync from the template",
     )
-    sync_parser.add_argument(
-        "--branch-name",
-        help="Override the auto-generated working branch name "
-        "(default: iati-docs-management/sync-<timestamp>)",
-    )
-    sync_parser.add_argument(
-        "--pr-body",
-        help="Body for the pull requests (default: auto-generated)",
-    )
-    sync_parser.add_argument(
-        "--push-delay",
-        type=float,
-        default=20.0,
-        metavar="SECONDS",
-        help="Seconds to wait between pushes, to spread downstream webhook\n"
-        "fan-out (e.g. ReadTheDocs build queue) when publishing many PRs\n"
-        "at once. Default: 20. Pass 0 to disable.",
-    )
+    _add_publish_args(sync)
 
-    # Sync-gitignore command
-    sync_gitignore_parser = subparsers.add_parser(
+    sync_gitignore = add_verb(
         "sync-gitignore",
-        help="Additively sync baseline .gitignore entries and open PRs",
-        description="For each Documentation-tagged repo: ensure .gitignore carries the\n"
-        "baseline entries (GITIGNORE_BASELINE), appending any that are missing\n"
-        "without touching the repo's existing entries, then commit, push, and\n"
-        "open a PR. Repos that already have every baseline entry are skipped\n"
-        "without producing a PR.\n\n"
-        ".gitignore is synced additively rather than verbatim because\n"
-        "downstream repos legitimately carry their own extra ignores.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        cmd_sync_gitignore,
+        "Additively sync baseline .gitignore entries and open PRs",
+        "Append any missing GITIGNORE_BASELINE entries to each repo's\n"
+        ".gitignore, leaving its existing entries alone, and open a PR for each\n"
+        "repo that changed.",
     )
-    sync_gitignore_parser.add_argument(
-        "--message",
-        "-m",
-        required=True,
-        help="Commit message (also used as PR title unless --pr-body overrides)",
-    )
-    sync_gitignore_parser.add_argument(
-        "--branch-name",
-        help="Override the auto-generated working branch name",
-    )
-    sync_gitignore_parser.add_argument(
-        "--pr-body",
-        help="Body for the pull requests (default: auto-generated)",
-    )
-    sync_gitignore_parser.add_argument(
-        "--push-delay",
-        type=float,
-        default=20.0,
-        metavar="SECONDS",
-        help="Seconds to wait between pushes, to spread downstream webhook\n"
-        "fan-out (e.g. ReadTheDocs build queue) when publishing many PRs\n"
-        "at once. Default: 20. Pass 0 to disable.",
-    )
+    _add_publish_args(sync_gitignore)
 
-    # Run-script command
-    run_script_parser = subparsers.add_parser(
+    run_script = add_verb(
         "run-script",
-        help="Run a script in each repo; PR any changes it produces",
-        description="Run a script in each Documentation-tagged repo's checkout and\n"
-        "collect its stdout, stderr, exit code, and any filesystem changes.\n\n"
-        "Behaviour:\n"
-        "  * If the script makes no filesystem changes anywhere, the run\n"
-        "    is purely informational - nothing is committed or pushed.\n"
-        "  * If the script makes changes in any repo, those changes are\n"
-        "    committed on a fresh working branch and opened as PRs against\n"
-        "    each repo's default branch. -m must be provided in this case.\n"
-        "  * If the script exits non-zero in any repo (or times out), the\n"
-        "    whole estate-wide run aborts and nothing is published.\n\n"
-        "Branch names default to iati-docs-management/script-<stem>-<ts>,\n"
-        "distinct from sync's branch naming.\n\n"
-        "Script contract:\n"
-        "  * Invoked as: <script> <repo-name>\n"
-        "  * cwd is set to the repo's checkout\n"
-        "  * Must be executable (chmod +x) and have a shebang\n"
-        "  * Must exit 0 to indicate success; non-zero aborts the run\n"
-        "  * Per-repo timeout: 5 minutes",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        cmd_run_script,
+        "Run a script in each repo; PR any changes it produces",
+        "Run an executable script as '<script> <repo-name>' with cwd set to\n"
+        "each repo's checkout, allowing five minutes per repo.\n\n"
+        "A non-zero exit in any repo aborts the run and publishes nothing. If\n"
+        "the script changes files, the changes are committed and opened as PRs,\n"
+        "which needs -m. Otherwise nothing is published.",
     )
-    run_script_parser.add_argument(
-        "script",
-        help="Path to the script to run in each repo (must be executable)",
-    )
-    run_script_parser.add_argument(
+    run_script.add_argument("script", help="Path to the script to run in each repo")
+    run_script.add_argument(
         "--include-template",
         action="store_true",
         help="Also run on the template repo (iati-docs-base)",
     )
-    run_script_parser.add_argument(
-        "--message",
-        "-m",
-        help="Commit message and PR title - required if the script produces changes",
-    )
-    run_script_parser.add_argument(
-        "--branch-name",
-        help="Override the auto-generated working branch name",
-    )
-    run_script_parser.add_argument(
-        "--pr-body",
-        help="Body for the pull requests (default: auto-generated)",
-    )
-    run_script_parser.add_argument(
-        "--push-delay",
-        type=float,
-        default=20.0,
-        metavar="SECONDS",
-        help="Seconds to wait between pushes, to spread downstream webhook\n"
-        "fan-out (e.g. ReadTheDocs build queue) when publishing many PRs\n"
-        "at once. Default: 20. Pass 0 to disable.",
-    )
+    _add_publish_args(run_script, message_required=False)
 
-    # Checkout-all command
-    checkout_parser = subparsers.add_parser(
+    checkout_all = add_verb(
         "checkout-all",
-        help="Clone every tagged repo to a persistent dir for manual edits",
-        description="Clone every Documentation-tagged repo (and the template) to a\n"
-        "fresh directory under /tmp, create a working branch in each, and\n"
-        "exit. The directory is NOT cleaned up - that's the whole point.\n\n"
-        "Use this when the work doesn't fit a template-sync or a single\n"
-        "scripted change: edit files by hand across the checkouts, then\n"
-        "run 'make-prs' to commit and PR everything in one go.\n\n"
-        "macOS prunes /tmp via the periodic daily job (files older than 3\n"
-        "days), so anything left behind is reclaimed by the OS.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        cmd_checkout_all,
+        "Clone every tagged repo to a persistent dir for manual edits",
+        "Clone every repo and the template into a fresh directory under /tmp,\n"
+        "on a working branch, and leave it there. Edit the checkouts by hand,\n"
+        "then run 'make-prs'.",
     )
-    checkout_parser.add_argument(
+    checkout_all.add_argument(
         "--branch-name",
-        help="Override the auto-generated working branch name "
+        help="Working branch name "
         "(default: iati-docs-management/refactor-<timestamp>)",
     )
-    checkout_parser.add_argument(
+    checkout_all.add_argument(
         "--no-template",
         action="store_true",
         help="Skip cloning the template repo (iati-docs-base)",
     )
 
-    # Make-prs command
-    make_prs_parser = subparsers.add_parser(
+    make_prs = add_verb(
         "make-prs",
-        help="Commit and PR changes from a checkout-all directory",
-        description="For each repo checkout in --dir: stage uncommitted changes,\n"
-        "commit with -m MSG, push the working branch, and open a pull\n"
-        "request against the repo's default branch. Repos with nothing to\n"
-        "publish (clean tree and no commits ahead) are skipped.\n\n"
-        "Pair with 'checkout-all'.\n\n"
-        "The working branch is detected from the first checkout unless\n"
-        "--branch-name is given. All checkouts must be on the same branch;\n"
-        "any repo on a different branch will abort with an error.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        cmd_make_prs,
+        "Commit and PR changes from a checkout-all directory",
+        "Commit any uncommitted changes in each checkout under --dir, push the\n"
+        "working branch and open a PR. Repos with nothing to publish are\n"
+        "skipped. Every checkout must be on the same branch.",
     )
-    make_prs_parser.add_argument(
+    make_prs.add_argument(
         "--dir",
         required=True,
         help="Directory containing the repo checkouts (from checkout-all)",
     )
-    make_prs_parser.add_argument(
-        "--message",
-        "-m",
-        required=True,
-        help="Commit message (also used as PR title unless --pr-body overrides)",
-    )
-    make_prs_parser.add_argument(
-        "--branch-name",
-        help="Working branch name (default: detected from first checkout)",
-    )
-    make_prs_parser.add_argument(
-        "--pr-body",
-        help="Body for the pull requests (default: auto-generated)",
-    )
-    make_prs_parser.add_argument(
-        "--push-delay",
-        type=float,
-        default=20.0,
-        metavar="SECONDS",
-        help="Seconds to wait between pushes, to spread downstream webhook\n"
-        "fan-out (e.g. ReadTheDocs build queue) when publishing many PRs\n"
-        "at once. Default: 20. Pass 0 to disable.",
-    )
+    _add_publish_args(make_prs)
 
-    # Build command
-    build_parser = subparsers.add_parser(
+    build = add_verb(
         "build",
-        help="Build one repo's docs in a fresh venv inside a fresh clone",
-        description="Clone the repo at its default branch, create a fresh venv,\n"
-        "install requirements.txt, and run sphinx-build. Reports the\n"
-        "build exit code, any Sphinx warnings, and the list of HTML\n"
-        "pages produced. The checkout is removed when done.\n\n"
-        "Use this to confirm the upstream main of a single repo builds\n"
-        "cleanly on your machine.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        cmd_build,
+        "Build one repo's docs in a fresh venv inside a fresh clone",
+        "Clone the repo's default branch, install requirements.txt into a fresh\n"
+        "venv and run Sphinx. Reports the exit code, warnings and page count.",
     )
-    build_parser.add_argument(
-        "repo",
-        help="Name of the repo to build (e.g. iati-publisher-docs)",
-    )
+    build.add_argument("repo", help="Name of the repo to build")
 
-    # Build-all command
-    build_all_parser = subparsers.add_parser(
+    add_verb(
         "build-all",
-        help="Build every Documentation-tagged repo on main; report a health snapshot",
-        description="Clone every Documentation-tagged repo at its default branch,\n"
-        "build each in a fresh venv, and print a one-line summary per\n"
-        "repo (exit code, warning count, page count). Use this to take\n"
-        "a snapshot of estate-wide build health before/after a template\n"
-        "change.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        cmd_build_all,
+        "Build every repo's default branch and report a health snapshot",
     )
 
-    # Build-compare command
-    build_compare_parser = subparsers.add_parser(
+    build_compare_verb = add_verb(
         "build-compare",
-        help="Build a candidate checkout and a baseline ref; report what differs",
-        description="Build the candidate (a local checkout, including any uncommitted\n"
-        "edits) and a fresh clone of the same repo at --baseline-ref, then\n"
-        "report what differs between the two builds:\n"
-        "  * pages added / removed / modified (with per-page diffs)\n"
-        "  * Sphinx warnings added / removed\n\n"
-        "The report describes the change surface area. It does not adjudicate\n"
-        "whether each difference is intended or problematic - that's the\n"
-        "operator's call when rolling out an estate-wide change.\n\n"
-        "The candidate's working tree is never modified. Exit code is 1 only\n"
-        "when the candidate failed to build while the baseline succeeded;\n"
-        "otherwise 0, regardless of how much content changed.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        cmd_build_compare,
+        "Build a candidate checkout and a baseline ref; report what differs",
+        "Build a local checkout as it stands, uncommitted edits included, and a\n"
+        "fresh clone of the same repo at --baseline-ref. Reports pages and\n"
+        "Sphinx warnings added, removed or changed. The candidate's tree is not\n"
+        "modified.\n\n"
+        "Exits 1 only if the candidate fails to build and the baseline succeeds.",
     )
-    build_compare_parser.add_argument(
-        "--dir",
-        required=True,
-        help="Path to a local checkout to use as the candidate",
+    build_compare_verb.add_argument(
+        "--dir", required=True, help="Path to a local checkout to use as the candidate"
     )
-    build_compare_parser.add_argument(
+    build_compare_verb.add_argument(
         "--baseline-ref",
         default="main",
-        help="Git ref of the upstream repo to compare against (default: main)",
+        help="Branch or tag of the upstream repo to compare against (default: main)",
     )
 
+    return parser
+
+
+def main() -> int | None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.command is None:
         parser.print_help()
-        return
+        return None
 
-    # Every command in this tool depends on gh - either to enumerate the
-    # Documentation-tagged estate or to push branches and open PRs. Fail
-    # fast with a clear message if it isn't installed or authenticated,
-    # rather than letting the failure surface mid-run as a noisy
-    # CalledProcessError from a subprocess deep in the call stack.
+    # Every verb needs gh, so fail here rather than as a CalledProcessError
+    # from deep inside a run.
     try:
         auth_check = subprocess.run(
             ["gh", "auth", "status"],
@@ -1543,249 +1606,10 @@ def main():
             "`gh auth login` and try again."
         )
 
-    if args.command == "list":
-        repos = get_tagged_repos()
-        print("Documentation repositories:")
-        for repo in repos:
-            marker = " (template)" if repo == TEMPLATE_REPO else ""
-            print(f"  - {repo}{marker}")
-        return
-
-    if args.command == "list-prs":
-        prs = list_open_prs()
-        print_open_prs(prs)
-        return
-
-    if args.command == "check-protection":
-        protections = {name: get_branch_protection(name) for name in get_tagged_repos()}
-        print_protection(protections)
-        return
-
-    if args.command == "checkout-all":
-        branch_name = args.branch_name or generate_branch_name(prefix="refactor")
-        # Persistent: do NOT use the context manager - we want the
-        # checkouts to outlive this invocation so the user can edit them
-        # by hand and pass --dir to make-prs later.
-        manager = RepoManager(branch_name=branch_name)
-        print(f"Working directory: {manager.work_dir}")
-        print(f"Working branch: {manager.branch_name}")
-        print("Checking out repositories...")
-        manager.checkout_all(include_template=not args.no_template)
-        print(f"\nCheckouts ready in: {manager.work_dir}")
-        print(f"Branch in each repo:  {manager.branch_name}")
-        print("\nNext: edit files in the checkouts, then run:")
-        print(
-            f"  python scripts/repo_manager.py make-prs "
-            f"--dir {manager.work_dir} -m 'Your commit message'"
-        )
-        return
-
-    if args.command == "build":
-        with RepoManager() as manager:
-            print(f"Working directory: {manager.work_dir}")
-            result = build_repo(manager.checkout_repo(args.repo))
-            print_build_result(result)
-            return 1 if result.failed else 0
-
-    if args.command == "build-all":
-        with RepoManager() as manager:
-            print(f"Working directory: {manager.work_dir}")
-            print("Checking out repositories...")
-            manager.checkout_all()
-            results = manager.build_all_repos()
-            print_build_all_results(results)
-            failures = [r for r in results.values() if r.failed]
-            return 1 if failures else 0
-
-    if args.command == "build-compare":
-        candidate_path = Path(args.dir).resolve()
-        if not candidate_path.is_dir() or not (candidate_path / ".git").is_dir():
-            parser.error(f"--dir {candidate_path} is not a git checkout")
-
-        # Infer the repo name from the origin remote so we know what to
-        # clone for the baseline. Falls back to the directory name if the
-        # remote can't be read.
-        origin: str | None = None
-        try:
-            origin = git("remote", "get-url", "origin", cwd=candidate_path)
-            # Match …/<repo>.git or …/<repo>
-            repo_name = origin.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-        except subprocess.CalledProcessError:
-            repo_name = candidate_path.name
-
-        # Cross-check against the tagged estate. The baseline is always
-        # cloned from IATI/<repo>, so if the name isn't in the tagged set
-        # the clone will 404. Failing fast here gives a clearer message
-        # and surfaces the "repo exists but isn't tagged Documentation=true"
-        # case explicitly.
-        tagged = get_tagged_repos()
-        if repo_name not in tagged:
-            source = origin if origin else f"directory name {candidate_path.name!r}"
-            parser.error(
-                f"Repo {repo_name!r} (inferred from {source}) is not in the "
-                f"Documentation-tagged estate. Either:\n"
-                f"  * --dir points at a checkout that isn't an IATI docs repo, or\n"
-                f"  * the upstream repo exists but isn't tagged Documentation=true "
-                f"(use `list` to see what is).\n"
-                f"Baselines are always cloned from IATI/<repo> on github.com."
-            )
-
-        candidate = RepoCheckout(name=repo_name, path=candidate_path)
-        try:
-            comparison = build_compare(candidate, baseline_ref=args.baseline_ref)
-        except ValueError as exc:
-            parser.error(str(exc))
-        print_build_compare(comparison)
-        # Exit code is mechanical: only flag failure when the candidate
-        # itself failed to build while the baseline succeeded. Content
-        # differences are reported, not adjudicated - the operator judges
-        # whether each diff matches their intent.
-        candidate_failed = comparison.candidate.failed
-        baseline_failed = comparison.baseline.failed
-        return 1 if candidate_failed and not baseline_failed else 0
-
-    if args.command == "make-prs":
-        work_dir = Path(args.dir)
-        if not work_dir.is_dir():
-            parser.error(f"--dir {work_dir} is not a directory")
-
-        checkouts = sorted(
-            p
-            for p in work_dir.iterdir()
-            if p.is_dir() and (p / ".git").exists() and p.name != TEMPLATE_REPO
-        )
-        if not checkouts:
-            print(f"No repository checkouts found in {work_dir}")
-            return
-
-        branch_name = args.branch_name
-        if branch_name is None:
-            detected = current_branch(checkouts[0])
-            if not detected:
-                parser.error(
-                    f"Could not detect branch from {checkouts[0]} "
-                    "(detached HEAD?). Pass --branch-name."
-                )
-            branch_name = detected
-
-        # No context manager: the checkouts must survive for re-runs.
-        manager = RepoManager(
-            branch_name, work_dir, [RepoCheckout(p.name, p) for p in checkouts]
-        )
-
-        print(f"Working directory: {manager.work_dir}")
-        print(f"Working branch: {manager.branch_name}")
-        print(f"Repos to process: {len(manager.repos)}")
-        push_results = manager.update_all_to_github(
-            args.message,
-            pr_body=args.pr_body,
-            push_delay=args.push_delay,
-        )
-        print_publish_results(push_results)
-        return
-
-    # Pick a branch name. run-script uses a script-specific prefix so its
-    # branches are distinguishable from sync's at a glance.
-    branch_name = getattr(args, "branch_name", None)
-    if branch_name is None and args.command == "run-script":
-        script_stem = Path(args.script).stem
-        branch_name = generate_branch_name(prefix=f"script-{script_stem}")
-    if branch_name is None and args.command == "sync-gitignore":
-        branch_name = generate_branch_name(prefix="gitignore")
-    if branch_name is None:
-        branch_name = generate_branch_name()
-
-    with RepoManager(branch_name=branch_name) as manager:
-        print(f"Working directory: {manager.work_dir}")
-        print(f"Working branch: {manager.branch_name}")
-        print("Checking out repositories...")
-        manager.checkout_all()
-        print(f"Checked out {len(manager.repos)} repos (+ template)")
-
-        if args.command == "check":
-            results = {
-                repo.name: [check_file(manager.template, repo, f) for f in args.files]
-                for repo in manager.repos
-            }
-            print_file_results(
-                results, "CHECK RESULTS", _CHECK_NOTES, show_diff=not args.no_diff
-            )
-
-            extras = {
-                repo.name: extra_top_level_paths(manager.template, repo)
-                for repo in manager.repos
-            }
-            print_extra_paths(extras)
-
-            # Summary
-            total_files = sum(len(r) for r in results.values())
-            matching = sum(
-                check.state is FileState.MATCH
-                for checks in results.values()
-                for check in checks
-            )
-            print(f"\nSummary: {matching}/{total_files} files match template")
-
-        elif args.command == "sync":
-            copy_results = {
-                repo.name: [sync_file(manager.template, repo, f) for f in args.files]
-                for repo in manager.repos
-            }
-            print_file_results(copy_results, "FILE COPY", _SYNC_NOTES)
-
-            push_results = manager.update_all_to_github(
-                args.message,
-                pr_body=args.pr_body,
-                push_delay=args.push_delay,
-            )
-            print_publish_results(push_results)
-
-        elif args.command == "sync-gitignore":
-            sync_results = {
-                repo.name: [sync_gitignore_entries(repo)] for repo in manager.repos
-            }
-            print_file_results(sync_results, "GITIGNORE SYNC", _SYNC_NOTES)
-
-            push_results = manager.update_all_to_github(
-                args.message,
-                pr_body=args.pr_body,
-                push_delay=args.push_delay,
-            )
-            print_publish_results(push_results)
-
-        elif args.command == "run-script":
-            results = manager.run_script_on_all_repos(
-                args.script,
-                include_template=args.include_template,
-            )
-            print_run_script_results(results)
-
-            failed = next((r for r in results.values() if r.failure), None)
-            if failed:
-                print(
-                    f"\nERROR: Script failed in {failed.repo} "
-                    f"({failed.failure}). "
-                    "Aborting; no changes published."
-                )
-                return 1
-
-            repos_with_changes = [r for r in results.values() if r.changed_files]
-            if not repos_with_changes:
-                print("\nNo file changes; nothing to commit or push.")
-                return
-
-            if not args.message:
-                parser.error(
-                    f"Script produced changes in {len(repos_with_changes)} "
-                    "repo(s); pass -m to commit and open PRs."
-                )
-
-            push_results = manager.update_all_to_github(
-                args.message,
-                pr_body=args.pr_body,
-                push_delay=args.push_delay,
-            )
-            print_publish_results(push_results)
+    try:
+        return args.func(args)
+    except UsageError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":
