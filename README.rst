@@ -14,7 +14,6 @@ Repository layout
 
 * ``docs/`` - the Sphinx documentation site (maintainer guidance for IATI docs sites).
 * ``scripts/`` - reusable tooling for working across all IATI documentation repos.
-* ``example-scripts/`` - a parking spot for one-off scripts to keep around for reference after use.
 
 Many of the scripts rely on the `gh <https://cli.github.com/>`_ command-line tool; ensure it is installed and authenticated against the ``IATI`` org before running them.
 
@@ -190,7 +189,6 @@ Each invocation clones every tagged repo (plus the template) into a session dire
 Other scripts
 -------------
 
-* ``scripts/list_all_docs_repos.sh`` - print every repo currently tagged ``Documentation=true``.
 * ``scripts/find_untagged_repos.sh`` - print repos with "docs" in the name that are *not* tagged. Useful for spotting docs sites that need onboarding into the estate.
 
 Building this site's documentation
