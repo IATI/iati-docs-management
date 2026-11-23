@@ -178,6 +178,10 @@ class BuildResult:
     def failed(self) -> bool:
         return bool(self.failure)
 
+    @property
+    def stderr_tail(self) -> str:
+        return self.build_stderr_tail or self.install_stderr_tail
+
 
 @dataclass
 class BuildComparison:
@@ -842,11 +846,31 @@ class RepoManager:
         self.cleanup()
 
 
-def _print_header(heading: str) -> None:
-    """Print a standard 60-char ruled section header."""
-    print(f"\n{'=' * 60}")
-    print(f" {heading}")
-    print("=" * 60)
+def _print_header(*lines: str, width: int = 60) -> None:
+    """Print a ruled section header."""
+    print(f"\n{'=' * width}")
+    for line in lines:
+        print(f" {line}")
+    print("=" * width)
+
+
+def _print_lines(
+    lines: list[str], prefix: str = "    ", limit: int | None = None
+) -> None:
+    """Print lines under a prefix, summarising any beyond ``limit``."""
+    for line in lines[:limit]:
+        print(f"{prefix}{line}")
+    if limit is not None and len(lines) > limit:
+        print(f"    ... ({len(lines) - limit} more)")
+
+
+def _print_table(rows: list[dict[str, str]]) -> None:
+    """Print rows as left-aligned columns headed by their upper-cased keys."""
+    cols = list(rows[0])
+    widths = {c: max(len(c), *(len(r[c]) for r in rows)) for c in cols}
+    print()
+    for row in [{c: c.upper() for c in cols}, *rows]:
+        print("  ".join(row[c].ljust(widths[c]) for c in cols))
 
 
 _CHECK_NOTES = {
@@ -877,9 +901,8 @@ def print_file_results(
                 print(f"    {notes[check.state]}")
             if show_diff and check.diff:
                 print(f"\n    --- Diff for {check.path} ---")
-                for line in check.diff.splitlines():
-                    print(f"    {line}")
-                print(f"    --- End diff ---\n")
+                _print_lines(check.diff.splitlines())
+                print("    --- End diff ---\n")
 
 
 def print_publish_results(results: dict[str, PublishResult]) -> None:
@@ -937,16 +960,14 @@ _PR_REVIEW = {
 
 
 def print_open_prs(prs: list[dict]) -> None:
-    """Tabular dump of open PRs across the estate."""
     _print_header("OPEN PULL REQUESTS")
 
     if not prs:
         print("\nNo open PRs across the estate.")
         return
 
-    rows = []
-    for pr in sorted(prs, key=lambda p: (p["repo"], p["number"])):
-        rows.append(
+    _print_table(
+        [
             {
                 "repo": pr["repo"],
                 "pr": f"#{pr['number']}",
@@ -959,38 +980,30 @@ def print_open_prs(prs: list[dict]) -> None:
                 "branch": pr["branch"],
                 "title": pr["title"],
             }
-        )
+            for pr in sorted(prs, key=lambda p: (p["repo"], p["number"]))
+        ]
+    )
 
-    cols = [
-        "repo",
-        "pr",
-        "age",
-        "upd",
-        "merge",
-        "ci",
-        "review",
-        "author",
-        "branch",
-        "title",
-    ]
-    widths = {c: max(len(c.upper()), max(len(r[c]) for r in rows)) for c in cols}
-    header = "  ".join(c.upper().ljust(widths[c]) for c in cols)
-    print()
-    print(header)
-    for r in rows:
-        print("  ".join(r[c].ljust(widths[c]) for c in cols))
+
+_UNPROTECTED = dict.fromkeys(
+    [
+        "reviews",
+        "checks",
+        "strict",
+        "dismiss_stale",
+        "enforce_admins",
+        "force_push",
+        "deletions",
+    ],
+    "-",
+)
+
+
+def _enabled(protection: dict, setting: str) -> bool:
+    return bool((protection.get(setting) or {}).get("enabled"))
 
 
 def print_protection(protections: dict[str, dict | None]) -> None:
-    """
-    Tabular dump of branch protection state per repo.
-
-    Structural columns (reviews, force_push, deletions, dismiss_stale,
-    enforce_admins, strict) come from a single canonical policy and
-    should match across the estate. The CHECKS column (count of required
-    status contexts) is inherently per-repo because each context name
-    embeds the repo's RTD slug, so we report it but don't compare it.
-    """
     _print_header("BRANCH PROTECTION (main)")
     print(
         "\nStructural settings (reviews, force_push, etc) should match across"
@@ -1002,72 +1015,34 @@ def print_protection(protections: dict[str, dict | None]) -> None:
     for repo_name in sorted(protections):
         p = protections[repo_name]
         if p is None:
-            rows.append(
-                {
-                    "repo": repo_name,
-                    "protected": "no",
-                    "reviews": "-",
-                    "checks": "-",
-                    "strict": "-",
-                    "dismiss_stale": "-",
-                    "enforce_admins": "-",
-                    "force_push": "-",
-                    "deletions": "-",
-                }
-            )
+            rows.append({"repo": repo_name, "protected": "no", **_UNPROTECTED})
             continue
-        pr_reviews = p.get("required_pull_request_reviews") or {}
-        rsc = p.get("required_status_checks") or {}
+        reviews = p.get("required_pull_request_reviews") or {}
+        checks = p.get("required_status_checks") or {}
         rows.append(
             {
                 "repo": repo_name,
                 "protected": "yes",
-                "reviews": str(pr_reviews.get("required_approving_review_count", 0)),
-                "checks": str(len(rsc.get("contexts") or [])),
-                "strict": "yes" if rsc.get("strict") else "no",
+                "reviews": str(reviews.get("required_approving_review_count", 0)),
+                "checks": str(len(checks.get("contexts") or [])),
+                "strict": "yes" if checks.get("strict") else "no",
                 "dismiss_stale": (
-                    "yes" if pr_reviews.get("dismiss_stale_reviews") else "no"
+                    "yes" if reviews.get("dismiss_stale_reviews") else "no"
                 ),
-                "enforce_admins": (
-                    "yes" if (p.get("enforce_admins") or {}).get("enabled") else "no"
-                ),
+                "enforce_admins": "yes" if _enabled(p, "enforce_admins") else "no",
                 "force_push": (
-                    "allowed"
-                    if (p.get("allow_force_pushes") or {}).get("enabled")
-                    else "forbidden"
+                    "allowed" if _enabled(p, "allow_force_pushes") else "forbidden"
                 ),
                 "deletions": (
-                    "allowed"
-                    if (p.get("allow_deletions") or {}).get("enabled")
-                    else "forbidden"
+                    "allowed" if _enabled(p, "allow_deletions") else "forbidden"
                 ),
             }
         )
-
-    cols = [
-        "repo",
-        "protected",
-        "reviews",
-        "checks",
-        "strict",
-        "dismiss_stale",
-        "enforce_admins",
-        "force_push",
-        "deletions",
-    ]
-    widths = {c: max(len(c.upper()), max(len(r[c]) for r in rows)) for c in cols}
-    header = "  ".join(c.upper().ljust(widths[c]) for c in cols)
-    print()
-    print(header)
-    for r in rows:
-        print("  ".join(r[c].ljust(widths[c]) for c in cols))
+    _print_table(rows)
 
 
 def print_extra_paths(extras: dict[str, list[str]]) -> None:
-    """
-    Print top-level paths found in each repo that don't exist in the
-    template. Skips repos with nothing to report.
-    """
+    """Print each repo's extra top-level paths, skipping repos with none."""
     repos_with_extras = {name: paths for name, paths in extras.items() if paths}
     if not repos_with_extras:
         return
@@ -1080,8 +1055,7 @@ def print_extra_paths(extras: dict[str, list[str]]) -> None:
     )
     for repo_name, paths in repos_with_extras.items():
         print(f"\n{repo_name}:")
-        for p in paths:
-            print(f"  - {p}")
+        _print_lines(paths, prefix="  - ")
 
 
 def print_run_script_results(results: dict[str, ScriptResult]) -> None:
@@ -1091,30 +1065,25 @@ def print_run_script_results(results: dict[str, ScriptResult]) -> None:
         print(f"\n{repo_name}:")
         if r.failure:
             print(f"  FAILED: {r.failure}")
-
         if r.exit_code is not None:
             print(f"  exit: {r.exit_code}")
+
         stdout = r.stdout.rstrip()
         stderr = r.stderr.rstrip()
-
         if stdout:
             print("  stdout:")
-            for line in stdout.splitlines():
-                print(f"    {line}")
+            _print_lines(stdout.splitlines())
         if stderr:
             print("  stderr:")
-            for line in stderr.splitlines():
-                print(f"    {line}")
+            _print_lines(stderr.splitlines())
         if r.changed_files:
             print(f"  changed: {len(r.changed_files)} file(s)")
-            for line in r.changed_files:
-                print(f"    {line}")
+            _print_lines(r.changed_files)
         if not (r.failure or stdout or stderr or r.changed_files):
             print("  (no output, no changes)")
 
 
 def print_build_result(result: BuildResult) -> None:
-    """Print a single build_repo result in human-readable form."""
     _print_header(f"BUILD: {result.repo}")
     if result.failed:
         print(f"  FAILED at stage '{result.stage}': {result.failure}")
@@ -1128,25 +1097,18 @@ def print_build_result(result: BuildResult) -> None:
     print(f"  pages produced:  {len(result.pages)}")
     if result.warnings:
         print("  warning lines:")
-        for w in result.warnings[:20]:
-            print(f"    {w}")
-        if len(result.warnings) > 20:
-            print(f"    ... ({len(result.warnings) - 20} more)")
-    if result.install_stderr_tail and result.failed:
+        _print_lines(result.warnings, limit=20)
+    if result.failed and result.install_stderr_tail:
         print("  install stderr tail:")
-        for line in result.install_stderr_tail.splitlines():
-            print(f"    {line}")
-    if result.build_stderr_tail and result.failed:
+        _print_lines(result.install_stderr_tail.splitlines())
+    if result.failed and result.build_stderr_tail:
         print("  build stderr tail:")
-        for line in result.build_stderr_tail.splitlines():
-            print(f"    {line}")
+        _print_lines(result.build_stderr_tail.splitlines())
 
 
 def print_build_all_results(results: dict[str, BuildResult]) -> None:
-    """One-line summary per repo for build-all."""
-    print(f"\n{'=' * 72}")
-    print(" BUILD-ALL SUMMARY")
-    print("=" * 72)
+    """One-line summary per repo, then detail for any that failed."""
+    _print_header("BUILD-ALL SUMMARY", width=72)
     print(f"  {'repo':<40} {'status':<10} {'warns':>6} {'pages':>6}")
     print(f"  {'-' * 40} {'-' * 10} {'-' * 6} {'-' * 6}")
     for repo_name, r in results.items():
@@ -1154,57 +1116,40 @@ def print_build_all_results(results: dict[str, BuildResult]) -> None:
         warns = len(r.warnings)
         pages = len(r.pages)
         print(f"  {repo_name:<40} {status:<10} {warns:>6} {pages:>6}")
-    failures = [n for n, r in results.items() if r.failed]
+
+    failures = {name: r for name, r in results.items() if r.failed}
     if failures:
         print(f"\n  {len(failures)} repo(s) failed: {', '.join(failures)}")
-        for name in failures:
-            r = results[name]
+        for name, r in failures.items():
             print(f"\n  --- {name} failure detail ---")
             print(f"    stage: {r.stage}")
             print(f"    reason: {r.failure}")
-            tail = r.build_stderr_tail or r.install_stderr_tail
-            for line in tail.splitlines()[-15:]:
-                print(f"    {line}")
+            _print_lines(r.stderr_tail.splitlines()[-15:])
 
 
 def print_build_compare(comparison: BuildComparison) -> None:
-    """
-    Print a build_compare change report.
-
-    The report describes what differs between baseline and candidate. It
-    doesn't categorise differences as good or bad - that judgement belongs
-    to the operator rolling out the change.
-    """
-    print(f"\n{'=' * 72}")
-    print(f" BUILD-COMPARE: {comparison.repo}")
-    print(f"   baseline:  {comparison.baseline_ref}")
-    print(f"   candidate: {comparison.candidate_label}")
-    print("=" * 72)
-
-    baseline = comparison.baseline
-    candidate = comparison.candidate
-    print(
-        f"  baseline:  {'FAIL' if baseline.failed else 'OK':<5}  "
-        f"warns={len(baseline.warnings)}  "
-        f"pages={len(baseline.pages)}"
+    baseline, candidate = comparison.baseline, comparison.candidate
+    _print_header(
+        f"BUILD-COMPARE: {comparison.repo}",
+        f"  baseline:  {comparison.baseline_ref}",
+        f"  candidate: {comparison.candidate_label}",
+        width=72,
     )
-    print(
-        f"  candidate: {'FAIL' if candidate.failed else 'OK':<5}  "
-        f"warns={len(candidate.warnings)}  "
-        f"pages={len(candidate.pages)}"
-    )
+    for label, build in (("baseline:", baseline), ("candidate:", candidate)):
+        print(
+            f"  {label:<10} {'FAIL' if build.failed else 'OK':<5}  "
+            f"warns={len(build.warnings)}  "
+            f"pages={len(build.pages)}"
+        )
 
-    # If the candidate failed to build, surface that first - downstream
-    # sections may be empty or misleading. Don't suppress them; the
-    # operator may still want to see partial output.
+    # Shown first because the sections below may be empty or misleading
+    # after a failed build.
     if candidate.failed and not baseline.failed:
         print(f"\n  Candidate build did not complete (stage: {candidate.stage}).")
         print(f"  Reason: {candidate.failure}")
-        tail = candidate.build_stderr_tail or candidate.install_stderr_tail
-        if tail:
+        if candidate.stderr_tail:
             print("  stderr tail:")
-            for line in tail.splitlines()[-15:]:
-                print(f"    {line}")
+            _print_lines(candidate.stderr_tail.splitlines()[-15:])
 
     pages_added = comparison.pages_added
     pages_removed = comparison.pages_removed
@@ -1214,59 +1159,43 @@ def print_build_compare(comparison: BuildComparison) -> None:
 
     if pages_added:
         print(f"\n  Pages added ({len(pages_added)}):")
-        for p in pages_added[:30]:
-            print(f"    + {p}")
-        if len(pages_added) > 30:
-            print(f"    ... ({len(pages_added) - 30} more)")
+        _print_lines(pages_added, "    + ", limit=30)
 
     if pages_removed:
         print(f"\n  Pages removed ({len(pages_removed)}):")
-        for p in pages_removed[:30]:
-            print(f"    - {p}")
-        if len(pages_removed) > 30:
-            print(f"    ... ({len(pages_removed) - 30} more)")
+        _print_lines(pages_removed, "    - ", limit=30)
 
     if pages_modified:
         print(f"\n  Pages modified ({len(pages_modified)}):")
-        for p in sorted(pages_modified):
-            line_count = pages_modified[p].count("\n") + 1
-            print(f"    ~ {p}  ({line_count} diff line(s))")
+        for page, diff in sorted(pages_modified.items()):
+            line_count = diff.count("\n") + 1
+            print(f"    ~ {page}  ({line_count} diff line(s))")
         print()
-        for page in sorted(pages_modified):
+        for page, diff in sorted(pages_modified.items()):
             print(f"  --- diff: {page} ---")
-            for line in pages_modified[page].splitlines():
-                print(f"    {line}")
+            _print_lines(diff.splitlines())
             print()
 
     if warnings_added:
         print(f"  Warnings added ({len(warnings_added)}):")
-        for w in warnings_added[:20]:
-            print(f"    + {w}")
-        if len(warnings_added) > 20:
-            print(f"    ... ({len(warnings_added) - 20} more)")
+        _print_lines(warnings_added, "    + ", limit=20)
         print()
 
     if warnings_removed:
         print(f"  Warnings removed ({len(warnings_removed)}):")
-        for w in warnings_removed[:20]:
-            print(f"    - {w}")
-        if len(warnings_removed) > 20:
-            print(f"    ... ({len(warnings_removed) - 20} more)")
+        _print_lines(warnings_removed, "    - ", limit=20)
         print()
 
-    nothing_changed = not any(
+    changed = any(
         [pages_added, pages_removed, pages_modified, warnings_added, warnings_removed]
     )
-    if nothing_changed and not candidate.failed:
-        print("\n  No differences detected.")
-
-    # Only advertise the scratch checkout when there's actually something
-    # to inspect. macOS prunes /tmp eventually either way.
-    if not nothing_changed or candidate.failed:
+    if changed or candidate.failed:
         print(
             f"\n  Baseline checkout (for further inspection): "
             f"{comparison.baseline_scratch}"
         )
+    else:
+        print("\n  No differences detected.")
 
 
 def main():
