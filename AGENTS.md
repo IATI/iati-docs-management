@@ -108,10 +108,16 @@ TOP-LEVEL PATHS** section listing per-repo files and directories that
 exist in the repo but not the template. It's a hint, not a worklist;
 the tooling never touches those paths.
 
-### Three flavours of cross-repo change
+### Flavours of cross-repo change
 
 - **Template sync** (`sync`) — files identical across repos. PR per repo, all
   at once.
+- **Additive sync** (`sync-gitignore`) — a baseline set of entries guaranteed
+  present in a file whose other contents are the downstream's own. Appends
+  what's missing, never replaces or reorders. This is the "baseline, not
+  whitelist" principle made executable: `.gitignore` can't be synced verbatim
+  because downstream repos legitimately carry their own ignores. The baseline
+  is the template's own `.gitignore`, so a new entry goes there first.
 - **Scripted change** (`run-script`) — same modification, parameterised by
   repo. Script gets `cwd=<repo>` and `argv=[<repo-name>]`. Any non-zero exit
   aborts the whole run; no partial publishes.
@@ -123,21 +129,24 @@ the tooling never touches those paths.
 Picked over more elaborate "branch coordination" schemes because it stays
 linear: edit, validate, publish. No mid-flight state to recover from.
 
-### Build isolation = fresh clone
+### Build isolation = fresh venv, scratch output
 
-All build operations happen in a fresh `/tmp/iati-docs-<rand>/<repo>` clone
-with a freshly-created `.venv-build`. There's no concept of "use my existing
-.ve/" because that introduces machine state into the result. The fresh-clone
-property is what makes the tool trustable for AI agents that can't inspect
-the user's working environment.
+Every build creates a fresh venv and writes its HTML into a scratch
+directory, `/tmp/iati-build-<repo>-<rand>/` (`venv/` and `html/`), never
+inside the repo being built. `build` and `build-all` build fresh clones under
+`/tmp/iati-docs-<rand>/`; `build-compare` builds the candidate checkout in
+place and a fresh clone for the baseline. There's no concept of "use my
+existing .ve/" because that introduces machine state into the result. That
+is what makes the tool trustable for AI agents that can't inspect the user's
+working environment.
 
 ### Builds run from `docs/`
 
-`sphinx-build` is invoked with `cwd=<repo>/docs` and `python -m sphinx -b
-dirhtml . _build/html`. This mirrors the Makefile/make.bat convention and
-ensures `from project_info import ...` resolves (Sphinx 7+ `chdir`s to the
-conf.py dir but doesn't add it to `sys.path`; running from `docs/` puts
-`""` in `sys.path` resolving to `docs/` at import time).
+`sphinx-build` is invoked with `cwd=<repo>/docs` as `python -m sphinx -b
+dirhtml . <scratch>/html`. Running from `docs/` mirrors the Makefile/make.bat
+convention and ensures `from project_info import ...` resolves (Sphinx 7+
+`chdir`s to the conf.py dir but doesn't add it to `sys.path`; running from
+`docs/` puts `""` in `sys.path` resolving to `docs/` at import time).
 
 If you ever invoke `sphinx-build` from the repo root instead, the
 `project_info` import will fail. That's not a bug in any repo — it's how

@@ -14,7 +14,6 @@ Repository layout
 
 * ``docs/`` - the Sphinx documentation site (maintainer guidance for IATI docs sites).
 * ``scripts/`` - reusable tooling for working across all IATI documentation repos.
-* ``example-scripts/`` - a parking spot for one-off scripts to keep around for reference after use.
 
 Many of the scripts rely on the `gh <https://cli.github.com/>`_ command-line tool; ensure it is installed and authenticated against the ``IATI`` org before running them.
 
@@ -28,7 +27,7 @@ IATI documentation repos are identified by a GitHub `custom repository property 
 scripts/repo_manager.py
 -----------------------
 
-A Python 3.13 CLI for working across every Documentation-tagged repo, using ``iati-docs-base`` as the template. The commands cover three flavours of cross-repo work: template syncs, scripted changes, and manual refactors. Anything that's genuinely a one-off in a single repo should be done by hand on a single branch, not via this tool.
+A Python 3.13 CLI for working across every Documentation-tagged repo, using ``iati-docs-base`` as the template. The commands cover four flavours of cross-repo work: template syncs, additive syncs, scripted changes, and manual refactors. Anything that's genuinely a one-off in a single repo should be done by hand on a single branch, not via this tool.
 
 .. code-block:: bash
 
@@ -38,7 +37,7 @@ A Python 3.13 CLI for working across every Documentation-tagged repo, using ``ia
   # See every open PR across the estate, with merge / CI / review status
   python scripts/repo_manager.py list-prs
 
-  # Show branch protection state on each repo's default branch
+  # Show branch protection state on each repo's main branch
   python scripts/repo_manager.py check-protection
 
   # Show which repos diverge from the template, with diffs
@@ -46,6 +45,9 @@ A Python 3.13 CLI for working across every Documentation-tagged repo, using ``ia
 
   # Sync template files and open PRs against each repo's default branch
   python scripts/repo_manager.py sync -m "Sync from template"
+
+  # Add the template's .gitignore entries to any repo that lacks them
+  python scripts/repo_manager.py sync-gitignore -m "Add baseline .gitignore entries"
 
   # Run an inspection script in each repo (no changes -> no PRs)
   python scripts/repo_manager.py run-script ./find-myst-parser.sh
@@ -86,6 +88,13 @@ By default, ``check`` and ``sync`` operate on:
 * ``.vscode/launch.json``
 
 A difference from the template means something has changed and is reported as ``NEEDS ATTENTION`` with the diff. This applies to ``requirements.txt`` too: it's the file RTD and the ``build`` verb install from, so it's canonical in the template and synced out like everything else. An estate-wide dependency change (e.g. bumping Sphinx) means regenerating ``requirements.txt`` in the template and syncing it, not bumping the ``.in`` alone — nothing recompiles the ``.in`` at build time. A repo that genuinely needs extra packages should carry a ``requirements_local.in`` overlay rather than letting its lockfile diverge silently. Use ``--files`` on either command to override the default list.
+
+sync-gitignore
+~~~~~~~~~~~~~~
+
+Additively syncs a baseline set of ``.gitignore`` entries across the estate. The baseline is the template's own ``.gitignore``, so to add an entry estate-wide, add it to ``iati-docs-base`` first. For each repo it ensures every entry in the template's ``.gitignore`` is present, appending any that are missing and leaving the repo's existing entries untouched, then commits on a fresh working branch (default ``iati-docs-management/gitignore-<timestamp>``), pushes, and opens a PR. Repos that already carry every baseline entry are skipped without producing a PR.
+
+Unlike ``sync``, ``.gitignore`` is *not* synced verbatim — downstream repos legitimately carry their own extra ignores, so a verbatim sync would either clobber them or flag them as permanent drift. Matching is line-based: a repo that ignores ``scripts/__pycache__/`` still gets the un-anchored ``__pycache__/`` appended, because the narrow entry doesn't cover ``docs/`` (where Sphinx compiles ``conf.py`` and ``project_info.py`` at build time). ``-m MSG`` is required; override the branch with ``--branch-name`` and the PR body with ``--pr-body``.
 
 run-script
 ~~~~~~~~~~
@@ -134,7 +143,7 @@ The template checkout is included so you can use it as a reference while editing
 build, build-all, build-compare
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Static checks (``check``) tell you if files match the template; the build verbs tell you if the docs actually still build. Every build happens in a fresh ``/tmp`` clone with a freshly-created ``.venv-build`` so the result reflects ``requirements.txt`` alone, not whatever's in your working environment.
+Static checks (``check``) tell you if files match the template; the build verbs tell you if the docs actually still build. Every build installs into a freshly-created venv in a scratch directory under ``/tmp``, never inside the repo being built, so the result reflects ``requirements.txt`` alone, not whatever's in your working environment.
 
 ``build <repo>`` clones one repo at its default branch, installs ``requirements.txt``, runs ``sphinx-build``, and reports the exit code, warning count, and list of HTML pages produced. Use it as a one-off sanity check.
 
@@ -178,17 +187,11 @@ Example - publishing: bump a pinned dependency in ``requirements.txt``:
 Storage and cleanup
 ~~~~~~~~~~~~~~~~~~~
 
-Each invocation clones every tagged repo (plus the template) into a session directory under ``/tmp`` that is cleaned up when the command exits. Anything left behind is reaped by the OS's periodic ``/tmp`` cleanup.
-
-Python API
-~~~~~~~~~~
-
-For complex checks or syncs that don't fit the CLI, ``RepoManager`` exposes ``run_custom_check`` and ``run_custom_sync`` which accept a callable to run against each checkout. See ``example_check_python_version`` and ``example_sync_gitignore`` in ``scripts/repo_manager.py`` for the expected shape.
+Each invocation clones every tagged repo (plus the template) into a session directory under ``/tmp`` that is cleaned up when the command exits. Two things are left behind on purpose: the ``checkout-all`` directory, which ``make-prs`` needs, and each build's scratch directory (``/tmp/iati-build-<repo>-…``, plus ``/tmp/iati-baseline-<repo>-…`` for ``build-compare``), which holds the venv and HTML for inspection. Those are reaped by the OS's periodic ``/tmp`` cleanup.
 
 Other scripts
 -------------
 
-* ``scripts/list_all_docs_repos.sh`` - print every repo currently tagged ``Documentation=true``.
 * ``scripts/find_untagged_repos.sh`` - print repos with "docs" in the name that are *not* tagged. Useful for spotting docs sites that need onboarding into the estate.
 
 Building this site's documentation
