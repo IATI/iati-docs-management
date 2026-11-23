@@ -72,6 +72,24 @@ GITIGNORE_BASELINE = [
 ]
 
 
+def _run(cmd: list[str], cwd: Path | None = None) -> str:
+    """Run a command, raising on a non-zero exit, and return its stripped stdout."""
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True)
+    return proc.stdout.strip()
+
+
+def git(*args: str, cwd: Path | None = None) -> str:
+    return _run(["git", *args], cwd)
+
+
+def gh(*args: str, cwd: Path | None = None) -> str:
+    return _run(["gh", *args], cwd)
+
+
+def clone_url(repo_name: str) -> str:
+    return f"git@github.com:{GITHUB_ORG}/{repo_name}.git"
+
+
 @dataclass
 class RepoCheckout:
     """Represents a checked-out repository."""
@@ -128,21 +146,14 @@ class RepoManager:
         Returns:
             List of repository names.
         """
-        result = subprocess.run(
-            [
-                "gh",
-                "api",
-                f"/orgs/{GITHUB_ORG}/properties/values",
-                "--paginate",
-                "--jq",
-                '.[] | select(.properties[] | select(.property_name == "Documentation" and .value == "true")) | .repository_name',
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
+        names = gh(
+            "api",
+            f"/orgs/{GITHUB_ORG}/properties/values",
+            "--paginate",
+            "--jq",
+            '.[] | select(.properties[] | select(.property_name == "Documentation" and .value == "true")) | .repository_name',
         )
-        repos = [r.strip() for r in result.stdout.strip().split("\n") if r.strip()]
-        return repos
+        return [r.strip() for r in names.split("\n") if r.strip()]
 
     @staticmethod
     def get_branch_protection(repo_name: str) -> dict | None:
@@ -152,22 +163,17 @@ class RepoManager:
         Returns the GitHub API response dict if the branch is protected,
         or ``None`` if it isn't (HTTP 404 "Branch not protected").
         """
-        proc = subprocess.run(
-            [
-                "gh",
-                "api",
-                f"repos/{GITHUB_ORG}/{repo_name}/branches/main/protection",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            if "Branch not protected" in proc.stderr or "Not Found" in proc.stderr:
+        try:
+            protection = gh(
+                "api", f"repos/{GITHUB_ORG}/{repo_name}/branches/main/protection"
+            )
+        except subprocess.CalledProcessError as exc:
+            if "Branch not protected" in exc.stderr or "Not Found" in exc.stderr:
                 return None
             raise RuntimeError(
-                f"gh api failed for {repo_name}/main protection: {proc.stderr.strip()}"
-            )
-        return json.loads(proc.stdout)
+                f"gh api failed for {repo_name}/main protection: {exc.stderr.strip()}"
+            ) from exc
+        return json.loads(protection)
 
     @staticmethod
     def list_open_prs() -> list[dict]:
@@ -186,23 +192,17 @@ class RepoManager:
         )
         results = []
         for repo_name in RepoManager.get_tagged_repos():
-            proc = subprocess.run(
-                [
-                    "gh",
-                    "pr",
-                    "list",
-                    "--repo",
-                    f"{GITHUB_ORG}/{repo_name}",
-                    "--state",
-                    "open",
-                    "--json",
-                    fields,
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
+            prs = gh(
+                "pr",
+                "list",
+                "--repo",
+                f"{GITHUB_ORG}/{repo_name}",
+                "--state",
+                "open",
+                "--json",
+                fields,
             )
-            for pr in json.loads(proc.stdout):
+            for pr in json.loads(prs):
                 pr["repo"] = repo_name
                 pr["branch"] = pr.pop("headRefName")
                 results.append(pr)
@@ -219,23 +219,13 @@ class RepoManager:
             RepoCheckout object for the cloned repo.
         """
         repo_path = self.work_dir / repo_name
-        clone_url = f"git@github.com:{GITHUB_ORG}/{repo_name}.git"
 
         print(f"Cloning {repo_name}...")
-        subprocess.run(
-            ["git", "clone", "--depth", "1", clone_url, str(repo_path)],
-            check=True,
-            capture_output=True,
-        )
+        git("clone", "--depth", "1", clone_url(repo_name), str(repo_path))
 
         # Switch to the working branch immediately so any subsequent commit
         # or push lands there, never on the repo's default branch.
-        subprocess.run(
-            ["git", "switch", "-c", self.branch_name],
-            cwd=repo_path,
-            check=True,
-            capture_output=True,
-        )
+        git("switch", "-c", self.branch_name, cwd=repo_path)
 
         is_template = repo_name == TEMPLATE_REPO
         checkout = RepoCheckout(name=repo_name, path=repo_path, is_template=is_template)
@@ -455,18 +445,9 @@ class RepoManager:
                 result["stdout"] = proc.stdout
                 result["stderr"] = proc.stderr
 
-                status_proc = subprocess.run(
-                    ["git", "status", "--porcelain"],
-                    cwd=repo.path,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                result["changed_files"] = (
-                    status_proc.stdout.strip().splitlines()
-                    if status_proc.stdout.strip()
-                    else []
-                )
+                result["changed_files"] = git(
+                    "status", "--porcelain", cwd=repo.path
+                ).splitlines()
 
                 if proc.returncode != 0:
                     result["failed"] = True
@@ -494,27 +475,14 @@ class RepoManager:
     @staticmethod
     def _current_branch(repo_path: Path) -> str:
         """Return the currently checked-out branch (empty if detached HEAD)."""
-        result = subprocess.run(
-            ["git", "branch", "--show-current"],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return result.stdout.strip()
+        return git("branch", "--show-current", cwd=repo_path)
 
     @staticmethod
     def default_branch(repo_path: Path) -> str:
         """Return the upstream default branch name (e.g. 'main')."""
-        result = subprocess.run(
-            ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        head = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=repo_path)
         # e.g. "origin/main" -> "main"
-        return result.stdout.strip().removeprefix("origin/")
+        return head.removeprefix("origin/")
 
     def _ensure_safe_branch(self, repo: RepoCheckout) -> None:
         """
@@ -557,32 +525,19 @@ class RepoManager:
             "action": None,
         }
 
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=repo.path,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        changes = git("status", "--porcelain", cwd=repo.path)
 
-        if not status.stdout.strip():
+        if not changes:
             result["action"] = "skip"
             result["reason"] = "No changes to commit"
             return result
 
         result["action"] = "commit"
-        result["changes"] = status.stdout.strip().split("\n")
+        result["changes"] = changes.split("\n")
 
-        subprocess.run(
-            ["git", "add", "-A"],
-            cwd=repo.path,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", message],
-            cwd=repo.path,
-            check=True,
-        )
+        # Uncaptured so git's own output reaches the operator.
+        subprocess.run(["git", "add", "-A"], cwd=repo.path, check=True)
+        subprocess.run(["git", "commit", "-m", message], cwd=repo.path, check=True)
         return result
 
     def push_changes(
@@ -615,14 +570,9 @@ class RepoManager:
         # Count commits ahead of the default branch. Using rev-list avoids
         # parsing git's English porcelain output and works correctly even
         # if upstream tracking isn't yet configured for the new branch.
-        ahead_proc = subprocess.run(
-            ["git", "rev-list", "--count", f"origin/{default}..HEAD"],
-            cwd=repo.path,
-            capture_output=True,
-            text=True,
-            check=True,
+        commits_ahead = int(
+            git("rev-list", "--count", f"origin/{default}..HEAD", cwd=repo.path)
         )
-        commits_ahead = int(ahead_proc.stdout.strip())
 
         if commits_ahead == 0:
             result["action"] = "skip"
@@ -632,29 +582,24 @@ class RepoManager:
         result["action"] = "push"
         result["commits_ahead"] = commits_ahead
 
+        # Uncaptured so git's own output reaches the operator.
         subprocess.run(
             ["git", "push", "-u", "origin", self.branch_name],
             cwd=repo.path,
             check=True,
         )
-        subprocess.run(
-            [
-                "gh",
-                "pr",
-                "create",
-                "--title",
-                pr_title,
-                "--body",
-                pr_body,
-                "--base",
-                default,
-                "--head",
-                self.branch_name,
-            ],
+        gh(
+            "pr",
+            "create",
+            "--title",
+            pr_title,
+            "--body",
+            pr_body,
+            "--base",
+            default,
+            "--head",
+            self.branch_name,
             cwd=repo.path,
-            capture_output=True,
-            text=True,
-            check=True,
         )
         return result
 
@@ -992,13 +937,7 @@ class RepoManager:
 
         results: dict[str, dict] = {}
         for repo in repos_to_build:
-            default = self.default_branch(repo.path)
-            subprocess.run(
-                ["git", "checkout", default],
-                cwd=repo.path,
-                check=True,
-                capture_output=True,
-            )
+            git("checkout", self.default_branch(repo.path), cwd=repo.path)
             print(f"Building {repo.name}...")
             results[repo.name] = self.build_repo(repo)
         return results
@@ -1073,20 +1012,14 @@ class RepoManager:
                 baseline_scratch: where the baseline clone lives, for manual
                     deeper inspection
         """
-        clone_url = f"git@github.com:{GITHUB_ORG}/{candidate_repo.name}.git"
+        url = clone_url(candidate_repo.name)
 
         # Validate the baseline ref before doing any build work. ``git clone
         # --depth 1 --branch`` only accepts branch and tag refs, not commit
         # SHAs - and our error message is clearer than git's "Remote branch
         # <ref> not found in upstream origin". Doing this up front avoids
         # ~30s of wasted candidate build on a typo.
-        ls_remote = subprocess.run(
-            ["git", "ls-remote", "--heads", "--tags", clone_url, baseline_ref],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        if not ls_remote.stdout.strip():
+        if not git("ls-remote", "--heads", "--tags", url, baseline_ref):
             raise ValueError(
                 f"Baseline ref {baseline_ref!r} is not a branch or tag in "
                 f"{candidate_repo.name}. --baseline-ref accepts branch and "
@@ -1101,20 +1034,7 @@ class RepoManager:
         )
         baseline_path = baseline_scratch / candidate_repo.name
         print(f"Cloning baseline ({baseline_ref})...")
-        subprocess.run(
-            [
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                baseline_ref,
-                clone_url,
-                str(baseline_path),
-            ],
-            check=True,
-            capture_output=True,
-        )
+        git("clone", "--depth", "1", "--branch", baseline_ref, url, str(baseline_path))
         baseline_repo = RepoCheckout(name=candidate_repo.name, path=baseline_path)
         print(f"Building baseline ({baseline_ref})...")
         baseline_result = RepoManager.build_repo(baseline_repo)
@@ -2100,12 +2020,7 @@ def main():
             # checkout_repo creates a working branch; switch back to the
             # default so we build the same code that's on main.
             default = RepoManager.default_branch(checkout.path)
-            subprocess.run(
-                ["git", "checkout", default],
-                cwd=checkout.path,
-                check=True,
-                capture_output=True,
-            )
+            git("checkout", default, cwd=checkout.path)
             result = manager.build_repo(checkout)
             print_build_result(result)
             return 0 if not result["failed"] else 1
@@ -2130,13 +2045,7 @@ def main():
         # remote can't be read.
         origin: str | None = None
         try:
-            origin = subprocess.run(
-                ["git", "remote", "get-url", "origin"],
-                cwd=candidate_path,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
+            origin = git("remote", "get-url", "origin", cwd=candidate_path)
             # Match …/<repo>.git or …/<repo>
             repo_name = origin.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
         except subprocess.CalledProcessError:
@@ -2191,13 +2100,7 @@ def main():
 
         branch_name = args.branch_name
         if branch_name is None:
-            detected = subprocess.run(
-                ["git", "branch", "--show-current"],
-                cwd=checkouts[0],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
+            detected = RepoManager._current_branch(checkouts[0])
             if not detected:
                 parser.error(
                     f"Could not detect branch from {checkouts[0]} "
