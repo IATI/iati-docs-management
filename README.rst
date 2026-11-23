@@ -27,7 +27,7 @@ IATI documentation repos are identified by a GitHub `custom repository property 
 scripts/repo_manager.py
 -----------------------
 
-A Python 3.13 CLI for working across every Documentation-tagged repo, using ``iati-docs-base`` as the template. The commands cover three flavours of cross-repo work: template syncs, scripted changes, and manual refactors. Anything that's genuinely a one-off in a single repo should be done by hand on a single branch, not via this tool.
+A Python 3.13 CLI for working across every Documentation-tagged repo, using ``iati-docs-base`` as the template. The commands cover four flavours of cross-repo work: template syncs, additive syncs, scripted changes, and manual refactors. Anything that's genuinely a one-off in a single repo should be done by hand on a single branch, not via this tool.
 
 .. code-block:: bash
 
@@ -45,6 +45,9 @@ A Python 3.13 CLI for working across every Documentation-tagged repo, using ``ia
 
   # Sync template files and open PRs against each repo's default branch
   python scripts/repo_manager.py sync -m "Sync from template"
+
+  # Add the template's .gitignore entries to any repo that lacks them
+  python scripts/repo_manager.py sync-gitignore -m "Add baseline .gitignore entries"
 
   # Run an inspection script in each repo (no changes -> no PRs)
   python scripts/repo_manager.py run-script ./find-myst-parser.sh
@@ -89,7 +92,7 @@ A difference from the template means something has changed and is reported as ``
 sync-gitignore
 ~~~~~~~~~~~~~~
 
-Additively syncs a baseline set of ``.gitignore`` entries across the estate. For each repo it ensures every entry in ``GITIGNORE_BASELINE`` is present, appending any that are missing and leaving the repo's existing entries untouched, then commits on a fresh working branch (default ``iati-docs-management/gitignore-<timestamp>``), pushes, and opens a PR. Repos that already carry every baseline entry are skipped without producing a PR.
+Additively syncs a baseline set of ``.gitignore`` entries across the estate. The baseline is the template's own ``.gitignore``, so to add an entry estate-wide, add it to ``iati-docs-base`` first. For each repo it ensures every entry in the template's ``.gitignore`` is present, appending any that are missing and leaving the repo's existing entries untouched, then commits on a fresh working branch (default ``iati-docs-management/gitignore-<timestamp>``), pushes, and opens a PR. Repos that already carry every baseline entry are skipped without producing a PR.
 
 Unlike ``sync``, ``.gitignore`` is *not* synced verbatim — downstream repos legitimately carry their own extra ignores, so a verbatim sync would either clobber them or flag them as permanent drift. Matching is line-based: a repo that ignores ``scripts/__pycache__/`` still gets the un-anchored ``__pycache__/`` appended, because the narrow entry doesn't cover ``docs/`` (where Sphinx compiles ``conf.py`` and ``project_info.py`` at build time). ``-m MSG`` is required; override the branch with ``--branch-name`` and the PR body with ``--pr-body``.
 
@@ -184,7 +187,7 @@ Example - publishing: bump a pinned dependency in ``requirements.txt``:
 Storage and cleanup
 ~~~~~~~~~~~~~~~~~~~
 
-Each invocation clones every tagged repo (plus the template) into a session directory under ``/tmp`` that is cleaned up when the command exits. Anything left behind is reaped by the OS's periodic ``/tmp`` cleanup.
+Each invocation clones every tagged repo (plus the template) into a session directory under ``/tmp`` that is cleaned up when the command exits. Two things are left behind on purpose: the ``checkout-all`` directory, which ``make-prs`` needs, and each build's scratch directory (``/tmp/iati-build-<repo>-…``, plus ``/tmp/iati-baseline-<repo>-…`` for ``build-compare``), which holds the venv and HTML for inspection. Those are reaped by the OS's periodic ``/tmp`` cleanup.
 
 Other scripts
 -------------

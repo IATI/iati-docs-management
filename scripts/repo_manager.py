@@ -43,14 +43,6 @@ FILES_TO_CHECK = [
     "docs/conf.py",
 ]
 
-# Entries `sync-gitignore` appends to any .gitignore that lacks them.
-# __pycache__/ is un-anchored so it covers docs/, where Sphinx compiles conf.py.
-GITIGNORE_BASELINE = [
-    "__pycache__/",
-    "*.pyc",
-    ".DS_Store",
-]
-
 
 def _run(cmd: list[str], cwd: Path | None = None) -> str:
     """Run a command, raising on a non-zero exit, and return its stripped stdout."""
@@ -287,25 +279,32 @@ def extra_top_level_paths(template: RepoCheckout, repo: RepoCheckout) -> list[st
     )
 
 
-def sync_gitignore_entries(repo: RepoCheckout) -> FileCheck:
+def sync_gitignore_entries(template: RepoCheckout, repo: RepoCheckout) -> FileCheck:
     """
-    Append any missing ``GITIGNORE_BASELINE`` entries to a repo's ``.gitignore``.
+    Append the template's ``.gitignore`` entries that a repo's ``.gitignore`` lacks.
 
     Matching is by whole line, so a narrower entry such as
     ``scripts/__pycache__/`` does not count as covering ``__pycache__/``.
     """
+    template_file = template.path / ".gitignore"
+    if not template_file.exists():
+        return FileCheck(".gitignore", FileState.MISSING_IN_TEMPLATE)
+
     gitignore = repo.path / ".gitignore"
     existed = gitignore.exists()
     content = gitignore.read_text() if existed else ""
     existing = {line.strip() for line in content.splitlines()}
 
-    missing = [e for e in GITIGNORE_BASELINE if e not in existing]
+    entries = [line.strip() for line in template_file.read_text().splitlines()]
+    missing = [e for e in entries if e and not e.startswith("#") and e not in existing]
     if not missing:
         return FileCheck(".gitignore", FileState.MATCH)
 
-    if content and not content.endswith("\n"):
-        content += "\n"
-    gitignore.write_text(content + "\n".join(missing) + "\n")
+    # Appended rather than rewritten, so the repo's own lines stay byte-identical.
+    with gitignore.open("a") as f:
+        if content and not content.endswith("\n"):
+            f.write("\n")
+        f.write("\n".join(missing) + "\n")
     state = FileState.DIFFERS if existed else FileState.MISSING_IN_REPO
     return FileCheck(".gitignore", state)
 
@@ -1087,6 +1086,7 @@ def print_build_compare(comparison: BuildComparison) -> None:
         print()
         for page, diff in sorted(pages_modified.items()):
             print(f"  --- diff: {page} ---")
+            # Printed in full: a truncated diff hides what build-compare is run to show.
             _print_lines(diff.splitlines())
             print()
 
@@ -1178,7 +1178,10 @@ def cmd_sync(args: argparse.Namespace) -> None:
 def cmd_sync_gitignore(args: argparse.Namespace) -> None:
     branch_name = args.branch_name or generate_branch_name("gitignore")
     with checked_out_estate(branch_name) as manager:
-        results = {repo.name: [sync_gitignore_entries(repo)] for repo in manager.repos}
+        results = {
+            repo.name: [sync_gitignore_entries(manager.template, repo)]
+            for repo in manager.repos
+        }
         print_file_results(results, "GITIGNORE SYNC", _SYNC_NOTES)
         publish(manager, args)
 
@@ -1337,8 +1340,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Manage the IATI documentation estate. README.rst has the "
         "full guide.\n\n"
         "Read-only: list, list-prs, check-protection, check, build, build-all,\n"
-        "build-compare. Opens pull requests: sync, sync-gitignore, make-prs,\n"
-        "and run-script when the script changes files.",
+        "build-compare. Clones for hand edits, publishing nothing: checkout-all.\n"
+        "Opens pull requests: sync, sync-gitignore, make-prs, and run-script\n"
+        "when the script changes files.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -1391,10 +1395,10 @@ def build_parser() -> argparse.ArgumentParser:
     sync_gitignore = add_verb(
         "sync-gitignore",
         cmd_sync_gitignore,
-        "Additively sync baseline .gitignore entries and open PRs",
-        "Append any missing GITIGNORE_BASELINE entries to each repo's\n"
-        ".gitignore, leaving its existing entries alone, and open a PR for each\n"
-        "repo that changed.",
+        "Additively sync the template's .gitignore entries and open PRs",
+        "Append to each repo's .gitignore any entry of iati-docs-base's\n"
+        ".gitignore that it lacks, leaving its existing entries alone, and open\n"
+        "a PR for each repo that changed.",
     )
     _add_publish_args(sync_gitignore)
 

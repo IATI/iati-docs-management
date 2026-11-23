@@ -117,7 +117,7 @@ the tooling never touches those paths.
   what's missing, never replaces or reorders. This is the "baseline, not
   whitelist" principle made executable: `.gitignore` can't be synced verbatim
   because downstream repos legitimately carry their own ignores. The baseline
-  lives in `GITIGNORE_BASELINE`.
+  is the template's own `.gitignore`, so a new entry goes there first.
 - **Scripted change** (`run-script`) — same modification, parameterised by
   repo. Script gets `cwd=<repo>` and `argv=[<repo-name>]`. Any non-zero exit
   aborts the whole run; no partial publishes.
