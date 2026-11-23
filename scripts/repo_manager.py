@@ -1,12 +1,9 @@
 #!/usr/bin/env python3.13
 """
-Manage IATI documentation repositories.
+Manage the IATI documentation estate: every repo in the IATI GitHub org tagged
+with the ``Documentation`` custom property.
 
-Provides a CLI and Python API for working across every repository in the
-IATI GitHub org tagged with the Documentation custom property. Operations
-include listing the estate, checking files against the iati-docs-base
-template, syncing template files via pull request, and running arbitrary
-scripts in each repo.
+AGENTS.md explains the design and README.rst documents each verb.
 """
 
 import argparse
@@ -25,32 +22,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-# Patterns that vary between two builds of the same code and must be
-# normalised out before HTML pages are compared. Today the only known
-# offender is Sphinx's ``?v=<hash>`` asset cache-buster. Extend this list
-# if a future Sphinx/theme version introduces another build-volatile
-# value (e.g. timestamps in footers).
+# Text that differs between two builds of the same code, such as Sphinx's
+# ``?v=<hash>`` cache-buster, replaced before HTML pages are compared.
 _HTML_NORMALISERS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\?v=[0-9a-f]+"), "?v=NORM"),
 ]
 
-# The authoritative template repo
 TEMPLATE_REPO = "iati-docs-base"
 GITHUB_ORG = "IATI"
 
-# Files that should be tracked across all repos. requirements.txt is the
-# file that actually controls the build (RTD and the build verb both
-# install from it), so it's treated as canonical and synced from the
-# template like everything else; the .in files are its pip-compile inputs.
-# An estate-wide dependency change means regenerating requirements.txt in
-# the template and syncing it out. A repo that legitimately needs extra
-# packages should carry a requirements_local.in overlay rather than
-# diverging silently.
-#
-# docs/conf.py is shared verbatim across the estate; all per-repo values live
-# in docs/project_info.py, which it imports. project_info.py is deliberately
-# NOT tracked here - it's the per-repo half and must never be overwritten from
-# the template.
+# Files synced verbatim from the template. docs/project_info.py is the per-repo
+# half of conf.py and must never be added here.
 FILES_TO_CHECK = [
     ".readthedocs.yaml",
     "requirements.in",
@@ -61,13 +43,8 @@ FILES_TO_CHECK = [
     "docs/conf.py",
 ]
 
-# Baseline .gitignore entries every estate repo should carry. Synced
-# additively by `sync-gitignore`: missing entries are appended, existing
-# entries are never replaced or reordered. .gitignore is deliberately NOT
-# in FILES_TO_CHECK - downstream repos legitimately carry their own extra
-# ignores, so it must not be synced verbatim. __pycache__/ is un-anchored
-# so it catches docs/ (Sphinx compiles conf.py and project_info.py there
-# at build time) as well as scripts/.
+# Entries `sync-gitignore` appends to any .gitignore that lacks them.
+# __pycache__/ is un-anchored so it covers docs/, where Sphinx compiles conf.py.
 GITIGNORE_BASELINE = [
     "__pycache__/",
     "*.pyc",
@@ -83,6 +60,11 @@ def _run(cmd: list[str], cwd: Path | None = None) -> str:
 
 def git(*args: str, cwd: Path | None = None) -> str:
     return _run(["git", *args], cwd)
+
+
+def git_shown(*args: str, cwd: Path) -> None:
+    """Run git with its output left on the operator's terminal."""
+    subprocess.run(["git", *args], cwd=cwd, check=True)
 
 
 def gh(*args: str, cwd: Path | None = None) -> str:
@@ -111,7 +93,6 @@ def current_branch(repo_path: Path) -> str:
 def default_branch(repo_path: Path) -> str:
     """Return the upstream default branch name (e.g. 'main')."""
     head = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=repo_path)
-    # e.g. "origin/main" -> "main"
     return head.removeprefix("origin/")
 
 
@@ -205,12 +186,7 @@ class UsageError(Exception):
 
 
 def get_tagged_repos() -> list[str]:
-    """
-    Fetch all repos tagged with Documentation=true from GitHub.
-
-    Returns:
-        List of repository names.
-    """
+    """Names of every repo tagged Documentation=true."""
     names = gh(
         "api",
         f"/orgs/{GITHUB_ORG}/properties/values",
@@ -222,12 +198,7 @@ def get_tagged_repos() -> list[str]:
 
 
 def get_branch_protection(repo_name: str) -> dict | None:
-    """
-    Fetch branch protection settings for ``main`` in ``repo_name``.
-
-    Returns the GitHub API response dict if the branch is protected,
-    or ``None`` if it isn't (HTTP 404 "Branch not protected").
-    """
+    """GitHub's protection settings for a repo's ``main``, or None if unprotected."""
     try:
         protection = gh(
             "api", f"repos/{GITHUB_ORG}/{repo_name}/branches/main/protection"
@@ -242,15 +213,7 @@ def get_branch_protection(repo_name: str) -> dict | None:
 
 
 def list_open_prs() -> list[dict]:
-    """
-    List all open PRs across every Documentation-tagged repo.
-
-    Returns one dict per PR with: ``repo``, ``number``, ``title``,
-    ``branch``, ``author``, ``createdAt``, ``updatedAt``,
-    ``mergeable``, ``reviewDecision``, ``statusCheckRollup``. PRs
-    from other authors and unrelated branches show up too - the
-    verb is meant to surface other in-flight work alongside our own.
-    """
+    """Every open PR in the estate, whoever opened it, tagged with its ``repo``."""
     fields = (
         "number,title,headRefName,author,createdAt,updatedAt,"
         "mergeable,reviewDecision,statusCheckRollup"
@@ -354,16 +317,11 @@ def format_with_black(repo: RepoCheckout) -> BlackResult:
     Uses the black installed for this interpreter, which matches each repo's
     CI because ``requirements_dev.in`` is synced from the template.
     """
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "black", str(repo.path)],
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
-        return BlackResult(
-            failure=f"Python interpreter not found at {sys.executable!r}."
-        )
+    proc = subprocess.run(
+        [sys.executable, "-m", "black", str(repo.path)],
+        capture_output=True,
+        text=True,
+    )
 
     stderr_tail = _tail(proc.stderr, 20)
     if "No module named" in proc.stderr and "black" in proc.stderr:
@@ -489,17 +447,8 @@ def _normalise_html(content: str) -> str:
     return content
 
 
-def _page_diff(
-    baseline_html: str,
-    candidate_html: str,
-    page_name: str,
-) -> str | None:
-    """
-    Unified diff of two HTML pages after normalisation, or None if they
-    are identical post-normalisation. The diff is returned in full -
-    the operator ran build-compare to see what changed, and truncating
-    hides exactly the signal they asked for.
-    """
+def _page_diff(baseline_html: str, candidate_html: str, page_name: str) -> str | None:
+    """Unified diff of two HTML pages after normalisation, or None if identical."""
     baseline_norm = _normalise_html(baseline_html).splitlines()
     candidate_norm = _normalise_html(candidate_html).splitlines()
     if baseline_norm == candidate_norm:
@@ -516,38 +465,16 @@ def _page_diff(
 
 
 def build_compare(
-    candidate_repo: RepoCheckout,
-    baseline_ref: str = "main",
+    candidate_repo: RepoCheckout, baseline_ref: str = "main"
 ) -> BuildComparison:
     """
-    Build candidate and baseline, return a structured change report.
-
-    Builds the candidate in place (using its current working tree, then
-    clones a fresh copy of the same repo at ``baseline_ref`` into a
-    scratch directory and builds that as the baseline. The candidate's
-    working tree is never modified.
-
-    The result describes **what changed** between the two builds; it
-    does not adjudicate whether the change is good or bad. The operator
-    rolling out an estate-wide change is the one who can judge whether
-    each diff matches their intent.
-
-    Args:
-        candidate_repo: The checkout to test. Its working tree is built
-            as-is (uncommitted edits included).
-        baseline_ref: Git ref of the same repo to compare against
-            (default: ``main``).
-
-    ``pages_modified`` in the result maps each page that differs after
-    normalisation to its unified diff.
+    Build the candidate's working tree as it stands and a fresh clone of the
+    same repo at ``baseline_ref``, and report what differs between them.
     """
     url = clone_url(candidate_repo.name)
 
-    # Validate the baseline ref before doing any build work. ``git clone
-    # --depth 1 --branch`` only accepts branch and tag refs, not commit
-    # SHAs - and our error message is clearer than git's "Remote branch
-    # <ref> not found in upstream origin". Doing this up front avoids
-    # ~30s of wasted candidate build on a typo.
+    # git clone --branch takes only branches and tags, so anything else is
+    # rejected here before a build is spent on it.
     if not git("ls-remote", "--heads", "--tags", url, baseline_ref):
         raise UsageError(
             f"Baseline ref {baseline_ref!r} is not a branch or tag in "
@@ -571,23 +498,15 @@ def build_compare(
     baseline_pages = set(baseline.pages)
     candidate_pages = set(candidate.pages)
 
-    # Both sides only have html_dir set if the build actually succeeded.
-    # If either failed, skip the per-page diff (the warnings/pages_added
-    # sections still carry signal).
-    pages_modified: dict[str, str] = {}
+    # A failed build has no pages, so there are shared pages to diff only when
+    # both sides have an html_dir.
+    pages_modified = {}
     for page in sorted(baseline_pages & candidate_pages):
-        if baseline.html_dir is None or candidate.html_dir is None:
-            break
-        baseline_file = baseline.html_dir / page
-        candidate_file = candidate.html_dir / page
-        if not baseline_file.is_file() or not candidate_file.is_file():
-            continue
-        try:
-            baseline_html = baseline_file.read_text(errors="replace")
-            candidate_html = candidate_file.read_text(errors="replace")
-        except OSError:
-            continue
-        diff = _page_diff(baseline_html, candidate_html, page)
+        diff = _page_diff(
+            (baseline.html_dir / page).read_text(errors="replace"),
+            (candidate.html_dir / page).read_text(errors="replace"),
+            page,
+        )
         if diff is not None:
             pages_modified[page] = diff
 
@@ -706,12 +625,7 @@ class RepoManager:
         return results
 
     def _ensure_safe_branch(self, repo: RepoCheckout) -> None:
-        """
-        Refuse to operate unless the working tree is on the expected
-        working branch. Catches both the case where the checkout failed
-        to switch off the default branch and the case where someone
-        manually switched branches between checkout and publish.
-        """
+        """Refuse to commit or push unless the checkout is on the working branch."""
         current = current_branch(repo.path)
         default = default_branch(repo.path)
         if not current or current == default or current in ("main", "master"):
@@ -734,9 +648,8 @@ class RepoManager:
         if not git("status", "--porcelain", cwd=repo.path):
             return False
 
-        # Uncaptured so git's own output reaches the operator.
-        subprocess.run(["git", "add", "-A"], cwd=repo.path, check=True)
-        subprocess.run(["git", "commit", "-m", message], cwd=repo.path, check=True)
+        git_shown("add", "-A", cwd=repo.path)
+        git_shown("commit", "-m", message, cwd=repo.path)
         return True
 
     def push_changes(self, repo: RepoCheckout, pr_title: str, pr_body: str) -> bool:
@@ -749,12 +662,7 @@ class RepoManager:
         if int(ahead) == 0:
             return False
 
-        # Uncaptured so git's own output reaches the operator.
-        subprocess.run(
-            ["git", "push", "-u", "origin", self.branch_name],
-            cwd=repo.path,
-            check=True,
-        )
+        git_shown("push", "-u", "origin", self.branch_name, cwd=repo.path)
         gh(
             "pr",
             "create",
@@ -937,7 +845,7 @@ def _age_str(iso_dt: str) -> str:
 
 
 def _pr_ci_status(rollup: list | None) -> str:
-    """Roll up a PR's statusCheckRollup into a single ``ok|fail|pending|none``.
+    """Roll up a PR's statusCheckRollup into ok, fail, pending, mixed or none.
 
     statusCheckRollup mixes two shapes: ``CheckRun`` entries (GitHub
     Actions) use ``conclusion``; ``StatusContext`` entries (external
