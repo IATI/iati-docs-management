@@ -38,7 +38,7 @@ A Python 3.13 CLI for working across every Documentation-tagged repo, using ``ia
   # See every open PR across the estate, with merge / CI / review status
   python scripts/repo_manager.py list-prs
 
-  # Show branch protection state on each repo's default branch
+  # Show branch protection state on each repo's main branch
   python scripts/repo_manager.py check-protection
 
   # Show which repos diverge from the template, with diffs
@@ -141,7 +141,7 @@ The template checkout is included so you can use it as a reference while editing
 build, build-all, build-compare
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Static checks (``check``) tell you if files match the template; the build verbs tell you if the docs actually still build. Every build happens in a fresh ``/tmp`` clone with a freshly-created ``.venv-build`` so the result reflects ``requirements.txt`` alone, not whatever's in your working environment.
+Static checks (``check``) tell you if files match the template; the build verbs tell you if the docs actually still build. Every build installs into a freshly-created venv in a scratch directory under ``/tmp``, never inside the repo being built, so the result reflects ``requirements.txt`` alone, not whatever's in your working environment.
 
 ``build <repo>`` clones one repo at its default branch, installs ``requirements.txt``, runs ``sphinx-build``, and reports the exit code, warning count, and list of HTML pages produced. Use it as a one-off sanity check.
 
